@@ -3,10 +3,10 @@ import sys
 import cv2
 import torch
 import numpy as np
+from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 
 sys.path.append(os.path.abspath("Video_Depth_Anything"))
-
 from video_depth_anything.video_depth import VideoDepthAnything
 
 # --- Load VDA model ---
@@ -35,10 +35,8 @@ def compute_focus_and_spread(alpha_gray, depth_map):
 
 # --- Use VDA to get depth ---
 def get_video_depths(frames, model, input_size=518, device='cuda', fp32=False):
-    # Convert list of frames to NumPy array
-    frame_array = np.stack(frames, axis=0)  # shape: (N, H, W, 3)
+    frame_array = np.stack(frames, axis=0)
     depths, _ = model.infer_video_depth(frame_array, target_fps=-1, input_size=input_size, device=device, fp32=fp32)
-    # Normalize each depth frame
     norm_depths = [(d - d.min()) / (d.max() - d.min() + 1e-8) for d in depths]
     return norm_depths
 
@@ -57,13 +55,13 @@ def temporally_smooth_depth(depth_maps, t, radius=2):
 # --- Apply defocus blur ---
 def apply_depth_blur(image, depth_map, focus, focus_range=0.1, max_sigma=6.0):
     is_gray = image.ndim == 2
-    if is_gray: image = image[..., np.newaxis]
+    if is_gray:
+        image = image[..., np.newaxis]
 
     blur_levels = np.zeros_like(depth_map)
     lower, upper = focus - focus_range, focus + focus_range
     blur_levels[depth_map < lower] = 1.0
     blur_levels[depth_map > upper] = 0.0
-
     mask_mid = (depth_map >= lower) & (depth_map <= upper)
     t = np.clip((depth_map[mask_mid] - lower) / (upper - lower), 0, 1)
     blur_levels[mask_mid] = 1.0 - np.exp(-5 * t)
@@ -121,12 +119,13 @@ def process_video_blur(input_rgb, input_alpha, output_rgb, output_alpha, output_
 
     model, device = load_vda_model(vda_ckpt)
 
-    # Load all frames first
+    # Load all frames
     rgb_frames, alpha_frames = [], []
     while True:
         ret_rgb, rgb = cap_rgb.read()
         ret_alpha, alpha = cap_alpha.read()
-        if not ret_rgb or not ret_alpha: break
+        if not ret_rgb or not ret_alpha:
+            break
         rgb_frames.append(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
         alpha_frames.append(alpha)
 
@@ -134,7 +133,7 @@ def process_video_blur(input_rgb, input_alpha, output_rgb, output_alpha, output_
 
     depth_maps = get_video_depths(rgb_frames, model, input_size=518, device=device)
 
-    # Focus stats
+    # Compute focus & range
     focus_list, spread_list = [], []
     N = min(int(total * 0.05), 10)
     for i in range(N):
@@ -145,9 +144,9 @@ def process_video_blur(input_rgb, input_alpha, output_rgb, output_alpha, output_
 
     focus = np.mean(focus_list)
     focus_range = max(np.median(spread_list) * 0.8, 0.03)
-    print(f"\n\u2705 Focus: {focus:.3f} | Range: {focus_range:.3f}")
+    print(f"  ✅ Focus: {focus:.3f} | Range: {focus_range:.3f}")
 
-    for t in range(total):
+    for t in tqdm(range(total), desc="  🎞 Processing frames", leave=False):
         rgb = cv2.cvtColor(rgb_frames[t], cv2.COLOR_RGB2BGR)
         alpha = alpha_frames[t]
         alpha_gray = cv2.cvtColor(alpha, cv2.COLOR_BGR2GRAY)
@@ -158,33 +157,41 @@ def process_video_blur(input_rgb, input_alpha, output_rgb, output_alpha, output_
         blurred_alpha = apply_depth_blur(alpha_gray, avg_depth, focus, focus_range, max_sigma)
         out_alpha.write(cv2.cvtColor(blurred_alpha, cv2.COLOR_GRAY2BGR))
 
-        print(f"\U0001f7e2 Frame {t+1}/{total}", end='\r')
-
     out_rgb.release(); out_alpha.release(); out_depth.release()
-    print("\n\n✅ Done. All videos saved.")
+    print(f"  ✅ Saved: {os.path.basename(output_rgb)}\n")
 
-# Run
+# --- Batch Process All Videos ---
 if __name__ == "__main__":
-    process_video_blur(
-        "./data/video_composed/train/fgr/0174.mp4",
-        "./data/video_composed/train/pha/0174.mp4",
-        "0174_blurred_rgb.mp4",
-        "0174_blurred_alpha.mp4",
-        "0174_depth.mp4",
-        vda_ckpt="./Video_Depth_Anything/checkpoints/video_depth_anything_vitl.pth"
-    )
+    source_root = "./data/video_composed"
+    target_root = "./data/video_defocused"
+    splits = ["train", "test"]
 
+    os.makedirs(target_root, exist_ok=True)
 
+    for split in splits:
+        fgr_dir = os.path.join(source_root, split, "fgr")
+        pha_dir = os.path.join(source_root, split, "pha")
+        out_fgr_dir = os.path.join(target_root, split, "fgr")
+        out_pha_dir = os.path.join(target_root, split, "pha")
+        out_depth_dir = os.path.join(target_root, split, "depth")
 
-"""
-if __name__ == "__main__":
-    test_points = ['0167', '0080', '0239', '0241', '0266', '0295', '0353', '0405', '0120', 
-    '0171', '0324', '0426', '0456', '0470', '0000', '0174']
-    for test_point in test_points:
-        process_video_blur(
-            f"./data/video_defocused/train/fgr/{test_point}.mp4",
-            f"./data/video_defocused/train/pha/{test_point}.mp4",
-            f"{test_point}_blurred_rgb.mp4",
-            f"{test_point}_blurred_alpha_3ch.mp4",
-            f"{test_point}_estimated_depth.mp4"
-        )"""
+        os.makedirs(out_fgr_dir, exist_ok=True)
+        os.makedirs(out_pha_dir, exist_ok=True)
+        os.makedirs(out_depth_dir, exist_ok=True)
+
+        video_files = [f for f in os.listdir(fgr_dir) if f.endswith(".mp4")]
+
+        print(f"\n📁 Processing split: {split} ({len(video_files)} videos)")
+        for file_name in tqdm(video_files, desc=f"📦 {split}", position=0):
+            base_name = os.path.splitext(file_name)[0]
+
+            input_rgb = os.path.join(fgr_dir, file_name)
+            input_alpha = os.path.join(pha_dir, file_name)
+            output_rgb = os.path.join(out_fgr_dir, f"{base_name}_blurred_rgb.mp4")
+            output_alpha = os.path.join(out_pha_dir, f"{base_name}_blurred_alpha.mp4")
+            output_depth = os.path.join(out_depth_dir, f"{base_name}_depth.mp4")
+
+            try:
+                process_video_blur(input_rgb, input_alpha, output_rgb, output_alpha, output_depth)
+            except Exception as e:
+                print(f"❌ Failed on {file_name}: {e}")
