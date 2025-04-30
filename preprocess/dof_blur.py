@@ -194,6 +194,66 @@ def process_video_blur(input_rgb, input_alpha, output_rgb, output_alpha, output_
     del rgb_frames, alpha_frames, depth_maps
     torch.cuda.empty_cache(); gc.collect()
 
+def is_valid_video(path):
+    """Check if a video file is valid and can be properly read."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        cap.release()
+        return False
+    
+    # Check for valid FPS
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        cap.release()
+        return False
+    
+    # Check for valid frame count
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if frame_count <= 0:
+        cap.release()
+        return False
+    
+    # Check for valid dimensions
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if width <= 0 or height <= 0:
+        cap.release()
+        return False
+    
+    # Try to read at least one frame
+    ret, _ = cap.read()
+    cap.release()
+    return ret
+
+# Path to log corrupt videos
+corrupt_log_path = "./corrupt_videos.txt"
+
+def log_corrupt_video(video_name):
+    """Log corrupt video to separate file"""
+    with open(corrupt_log_path, "a") as f:
+        f.write(video_name + "\n")
+
+# Function to get log path for a specific split
+def get_completed_log_path(split):
+    """Get the path to the completed videos log for a specific split"""
+    return f"./completed_videos_{split}.txt"
+
+# Function to load completed videos for a specific split
+def load_completed_videos(split):
+    """Load the set of completed videos for a specific split"""
+    log_path = get_completed_log_path(split)
+    if os.path.exists(log_path):
+        with open(log_path, 'r') as f:
+            return set(f.read().splitlines())
+    return set()
+
+# Function to log a completed video for a specific split
+def log_completed_video(split, base):
+    """Log a completed video for a specific split"""
+    log_path = get_completed_log_path(split)
+    with open(log_path, "a") as f:
+        f.write(base + "\n")
+
 # 🔁 Main execution with restart trigger
 if __name__ == "__main__":
     vda_ckpt = "./Video_Depth_Anything/checkpoints/video_depth_anything_vitl.pth"
@@ -202,12 +262,23 @@ if __name__ == "__main__":
     splits = ["train", "test"]
 
     model, device = load_vda_model(vda_ckpt)
-    log_path = "./completed_videos.txt"
-    completed = set(open(log_path).read().splitlines()) if os.path.exists(log_path) else set()
+    
+    # Create corrupt videos log if it doesn't exist
+    if not os.path.exists(corrupt_log_path):
+        open(corrupt_log_path, "w").close()
+    
+    # Load already identified corrupt videos
+    corrupt_videos = set(open(corrupt_log_path).read().splitlines()) if os.path.exists(corrupt_log_path) else set()
 
     processed_count = 0  # 🆕 Track how many we processed in this run
 
     for split in splits:
+        print(f"\n📂 Processing split: {split}")
+        
+        # Load completed videos specifically for this split
+        completed = load_completed_videos(split)
+        print(f"   Found {len(completed)} previously completed videos for {split} split")
+        
         fgr_dir = os.path.join(source_root, split, "fgr")
         pha_dir = os.path.join(source_root, split, "pha")
         out_fgr = os.path.join(target_root, split, "fgr")
@@ -218,25 +289,44 @@ if __name__ == "__main__":
         os.makedirs(out_depth, exist_ok=True)
 
         files = sorted([f for f in os.listdir(fgr_dir) if f.endswith(".mp4")])
-        print(f"\n📂 Split: {split} | {len(files)} videos")
+        print(f"   Found {len(files)} videos in {split} split")
 
         for name in tqdm(files, desc=f"🎬 {split}"):
             base = os.path.splitext(name)[0]
-            if base in completed:
+            
+            # Skip if already processed or identified as corrupt
+            if base in completed or base in corrupt_videos:
                 continue
 
             fgr_path = os.path.join(fgr_dir, name)
             pha_path = os.path.join(pha_dir, name)
+            
+            # First verify that both files are valid videos
+            if not (is_valid_video(fgr_path) and is_valid_video(pha_path)):
+                print(f"⚠️ Skipping corrupt file: {base}")
+                log_corrupt_video(base)
+                continue
 
             cap = cv2.VideoCapture(fgr_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
-            duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            
+            # Additional safety check for zero fps or frame count
+            if fps <= 0 or frame_count <= 0:
+                print(f"⚠️ Invalid video properties for {base}: fps={fps}, frames={frame_count}")
+                log_corrupt_video(base)
+                cap.release()
+                continue
+                
+            duration = frame_count / fps
             cap.release()
 
             try:
                 if duration > SPLIT_THRESHOLD_SEC:
                     fgr_out = get_segmented_paths(fgr_path, split, "fgr")
                     pha_out = get_segmented_paths(pha_path, split, "pha")
+                    os.makedirs(os.path.dirname(fgr_out), exist_ok=True)
+                    os.makedirs(os.path.dirname(pha_out), exist_ok=True)
                     segment_video(fgr_path, fgr_out, base, fps)
                     segment_video(pha_path, pha_out, base, fps)
                     process_segments(base, split, model, device, 518, fgr_out, pha_out,
@@ -249,9 +339,8 @@ if __name__ == "__main__":
                         os.path.join(out_depth, f"{base}_depth.mp4"),
                         model, device)
 
-                with open(log_path, "a") as f:
-                    f.write(base + "\n")
-                completed.add(base)
+                # Log completion to split-specific log file
+                log_completed_video(split, base)
                 processed_count += 1
 
                 if processed_count >= MAX_VIDEOS_BEFORE_RESTART:
