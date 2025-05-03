@@ -14,3 +14,6 @@ The dataset provides 484 pairs of high-resolution alpha matte and foreground vid
 We tested using videos with only black backgrounds to synthesize a shallow depth of field blur effect, however, due to the lack of background, the depth estimation, which is essential for our simulation, can be flickering and unstable. Therefore, we first randomly composite videos with provided background images.  
 
 To simulate a DoF blur, we used depth-aware Gaussian blur so that the whole blur is calculate similar to how photographical DoF is. For stable and temporal consistency, we estimate the subject depth in a video by Video-Depth-Anything, one of the latest depth estimation work specifically oriented towards sequence data.
+
+
+python inference_matanyone.py -i inputs/video/test-sample0 -m inputs/mask/test-sample0_1.png --suffix target1

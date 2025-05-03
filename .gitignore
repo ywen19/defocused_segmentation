@@ -167,4 +167,7 @@ cython_debug/
 *.mp4
 # dataset for assignment
 data/
+MatAnyone/
+sam2/
+segment-anything/
 .ipynb_checkpoints/

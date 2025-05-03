@@ -1,23 +1,36 @@
 import os
 import sys
-import cv2
-import torch
-import random
-import numpy as np
-from tqdm import tqdm
-from scipy.ndimage import gaussian_filter
 import gc
 import psutil
+from typing import Tuple, List
+
+import random
+from tqdm import tqdm
+
+import cv2
+import torch
+import numpy as np
+from scipy.ndimage import gaussian_filter
 
 sys.path.append(os.path.abspath("Video_Depth_Anything"))
 from video_depth_anything.video_depth import VideoDepthAnything
 
 TEMP_ROOT = "./data/video_tmp"
-MAX_SEGMENT_DURATION = 15
-SPLIT_THRESHOLD_SEC = 20
-MAX_VIDEOS_BEFORE_RESTART = 5
+MAX_SEGMENT_DURATION = 15          # cut long video to short clips to avoid memory leak
+SPLIT_THRESHOLD_SEC = 20           # determine if a video need to be segmented
+MAX_VIDEOS_BEFORE_RESTART = 5      # used by the shell script; kill the progress and restart due to uni pc cannot del variables properly
+
 
 def load_vda_model(ckpt_path="./Video_Depth_Anything/checkpoints/video_depth_anything_vitl.pth", encoder="vitl"):
+    """
+    Load video-depth-anything model for depth estimation;
+
+    ckpt_path : str, path to the downloaded pretrain vda;
+    encoder   : str, encoder type used by vda;
+
+    return    : Tuple[torch.nn.Module, str]
+    """
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -28,28 +41,74 @@ def load_vda_model(ckpt_path="./Video_Depth_Anything/checkpoints/video_depth_any
     return model.to(device).eval(), device
 
 def estimate_chunk_size(base=8, safety=0.85, min_c=2, max_c=32):
+    """
+    Dynamically calculate an appropriate "chunk size" for processing data on a CUDA-enabled GPU;
+
+    base   : int, base multiplier for chunk size;
+    safety : float, the max memory percentage allowed to be used for the process;
+    min_c  : int, min chunk size;
+    max_c  : int, max chunk size;
+
+    return : int
+    """
+
     if not torch.cuda.is_available(): return base
     try:
-        total = torch.cuda.get_device_properties(0).total_memory
-        reserved = torch.cuda.memory_reserved(0)
-        allocated = torch.cuda.memory_allocated(0)
-        free = total - max(reserved, allocated)
+        total = torch.cuda.get_device_properties(0).total_memory   # get total gpy memory
+        reserved = torch.cuda.memory_reserved(0)                   # reserved memory by torch caching allocator
+        allocated = torch.cuda.memory_allocated(0)                 # memory currently used by tensors
+        free = total - max(reserved, allocated)                    # estimate free memory
+        # memory to be used by scaling the current free memory
+        # then clamp the result for the available chunk size
         return max(min_c, min(max_c, int(base * ((free / total) * safety))))
     except: return base
 
 def compute_focus_and_spread(alpha_gray, depth_map):
-    h, w = alpha_gray.shape
-    center = np.zeros_like(alpha_gray, dtype=bool)
+    """"
+    Calculate the focus and spread for defocus simulation;
+    This is guided by the foreground subject matte (or mask);
+    Basically it performs  analysis of depth values within a central region and under a threshold condition.
+
+    alpha_gray : np.ndarray, the gray scale matte from the all-in-focus frame/video;
+    depth_map  : np.ndarray, estimated by the vda;
+
+    return Tuple[float, float]
+    """
+    
+    # We compute focus and spread using the intersection of the central frame region and the foreground mask
+    # This avoids the need to compute the bounding box or centroid of the subject geometry
+    # The reasoning is that we're simulating defocus with a *fixed focal plane*
+    # similar to how focus works in real-world cinematography
+    # In many filming scenarios, the focal setting doesn't change dynamically as subjects move
+    # So this method assumes cinematic fixed-focus shots (a real-world analogy)
+    h, w = alpha_gray.shape 
+    center = np.zeros_like(alpha_gray, dtype=bool)     
     center[h//4:h*3//4, w//4:w*3//4] = True
     mask = (alpha_gray > 127) & center
-    if np.sum(mask) == 0: return 0.5, 0.05
-    vals = depth_map[mask]
-    focus = float(np.median(vals))
+    
+    # if no mask
+    if np.sum(mask) == 0: return 0.5, 0.05  # depth midpoint for neutral focus, and a safe spread
+
+    vals = depth_map[mask]  # extract depth values where the mask is true
+    focus = float(np.median(vals))  # the focus should be driven by the most typical foreground subject depth
+    # spread as the difference between the 95th and 5th percentile of the depth and avoid extreme outliers
     spread_val = np.percentile(vals, 95) - np.percentile(vals, 5)
+    # clip to ensure the spread is not too narrow or too wide
     spread = float(np.clip(spread_val, 0.02, 0.15))
     return focus, spread
 
 def get_video_depths_chunked(frames, model, input_size=518, device='cuda', chunk_size=8):
+    """
+    Estimate depth in chunk to avoid OOM;
+
+    frames     : List[np.ndarray], list of rgb frames (h*w*3)
+    model      : torch.nn.model, loaded vda
+    input_size : inpur resolution for depth estimation
+    device     : device to tun; by default CUDA
+    chunk_size : number of frames to process at once
+
+    return: List[np.ndarray]
+    """
     results = []
     for i in range(0, len(frames), chunk_size):
         chunk = frames[i:i + chunk_size]
@@ -59,19 +118,45 @@ def get_video_depths_chunked(frames, model, input_size=518, device='cuda', chunk
         except Exception as e:
             torch.cuda.empty_cache(); gc.collect()
             raise RuntimeError(f"Chunk OOM at frames {i}-{i+len(chunk)-1}") from e
+        # normalize estimated depth to 0-1 by min-max normalization
         results.extend([(d - d.min()) / (d.max() - d.min() + 1e-8) for d in depths])
         torch.cuda.empty_cache(); gc.collect()
     return results
 
 def temporally_smooth_depth(depth_maps, t, radius=2):
+    """
+    Smoothing out depth with a temporal gaussian kernel with a sliding window across frames;
+    This is to reduce temporal jitter in depth maps, resulting in a more stable, 
+    natural-looking defocus blur across video frames.
+
+    We originally has this for depth estimation with midas;
+    vda is more reliable since it is designed for sequence.
+    Still we keep this for vda.
+
+    depth_maps : List[np.ndarray], list of depth maps for the video
+    t          : int, current timestep (frame) for smoothing
+    radius     : int, sliding window range for neighboring frames on each side of t for smoothing
+
+    return: np.ndarray
+    """
+
     weights, frames = [], []
     for o in range(-radius, radius + 1):
-        idx = np.clip(t + o, 0, len(depth_maps)-1)
-        w = np.exp(- (o**2) / (2 * radius**2))
+        idx = np.clip(t + o, 0, len(depth_maps)-1)  # actual frame index in the sliding window
+        # gaussian_w(o) = exp(-o^2/(2*radius^2))
+        w = np.exp(- (o**2) / (2 * radius**2))  # gaussian weight; frame closer to t get higher weight
         weights.append(w); frames.append(depth_maps[idx])
+    # pairs depth map and its assicated gaussian weight
+    # multiply to get smoothed weighted depth for each frame
+    # then sum up to get the final depth at time t
     return gaussian_filter(np.sum([w*f for w,f in zip(weights, frames)], axis=0) / np.sum(weights), sigma=1)
 
 def apply_depth_blur(image, depth, focus, focus_range=0.1, max_sigma=6.0):
+    """
+    Apply depth-driven defocus simulation to the rgb frame.
+
+    
+    """
     if image.ndim == 2: image = image[..., None]
     blur_levels = np.zeros_like(depth)
     lower, upper = focus - focus_range, focus + focus_range
