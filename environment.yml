@@ -7,38 +7,37 @@ channels:
 dependencies:
   - python=3.10
   - pip=23.0
-  - conda-forge::ffmpeg
+  - ffmpeg  # from conda-forge
   - git
   - pip:
-    # SAM2 requirements with CUDA 12.4 support
-    - torch>=2.5.1 --index-url https://download.pytorch.org/whl/cu124
-    - torchvision>=0.20.1 --index-url https://download.pytorch.org/whl/cu124
-    - numpy>=1.24.4
-    - opencv-python==4.10.0.84
-    - matplotlib>=3.9.2
-    - pycocotools>=2.0.7
-    - jupyterlab
-    - ipywidgets
-    - hydra-core>=1.3.2
-    - iopath>=0.1.10
-    - pillow>=9.4.0
-    - huggingface_hub>=0.25.2
-    - transformers>=4.36.0
-    # MatAnyone additional requirements (not in SAM2)
-    - cython
-    - gitpython>=3.1
-    - hickle>=5.0 
-    - tensorboard>=2.11
-    - scipy>=1.7
-    - tqdm>=4.66.1
-    - gradio>=3.34
-    - gdown>=4.7.1
-    - einops>=0.6
-    - PySide6>=6.2.0
-    - charset-normalizer>=3.1.0
-    - netifaces>=0.11.0
-    - cchardet>=2.1.7
-    - easydict
-    - av>=0.5.2
-    - git+https://github.com/cheind/py-thin-plate-spline
-    - "imageio>=2.33,!=2.35.0"
+      - torch>=2.5.1 --index-url https://download.pytorch.org/whl/cu124
+      - torchvision>=0.20.1 --index-url https://download.pytorch.org/whl/cu124
+      - numpy>=1.24.4
+      - opencv-python==4.10.0.84
+      - matplotlib>=3.9.2
+      - pycocotools>=2.0.7
+      - jupyterlab
+      - ipywidgets
+      - hydra-core>=1.3.2
+      - iopath>=0.1.10
+      - pillow>=9.4.0
+      - huggingface_hub>=0.25.2  # ✅ correct package
+      - transformers>=4.36.0
+      - cython
+      - gitpython>=3.1
+      - hickle>=5.0
+      - tensorboard>=2.11
+      - scipy>=1.7
+      - tqdm>=4.66.1
+      - gradio>=3.34
+      - gdown>=4.7.1
+      - einops>=0.6
+      - PySide6>=6.2.0
+      - charset-normalizer>=3.1.0
+      - netifaces>=0.11.0
+      - cchardet>=2.1.7
+      - easydict
+      - av>=0.5.2
+      - git+https://github.com/cheind/py-thin-plate-spline
+      - "imageio>=2.33,!=2.35.0"
+      - ultralytics
