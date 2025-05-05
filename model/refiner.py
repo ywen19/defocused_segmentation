@@ -1,15 +1,3 @@
-"""
-Our Matte Refiner module framework. This is the core of the project.
-
-It consists of five modules: a blur estimator, shallow attention encoder, wavelet encoder, 
-blur-aware transformer, and edge-preserving decoder. The blur estimator predicts a defocus 
-map to guide feature extraction. The shallow encoder provides low-level features and attention. 
-The wavelet encoder uses Haar DWT to capture both semantic structure and fine edges. The 
-transformer enhances context modeling with blur-guided attention. The decoder fuses features via 
-lightweight upsampling and edge modulation to reconstruct high-quality mattes, especially around 
-blurry boundaries.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,7 +49,7 @@ class WaveletUNetEncoder(nn.Module):
         out = torch.cat([low_feat, high_feat], dim=1)
         return self.fuse(out)
 
-# ------------------- Blur Estimator ----------------------
+# ------------------- Defocus Blur Estimator ----------------------
 class DefocusBlurEstimator(nn.Module):
     def __init__(self):
         super().__init__()
@@ -96,9 +84,10 @@ class ShallowAttentionEncoder(nn.Module):
         return feat, attn
 
 # ------------------- Transformer Block ----------------------
-class BlurAwareTransformerBlock(nn.Module):
-    def __init__(self, in_dim, heads=4, ff_dim=512):
+class WindowedBlurTransformerBlock(nn.Module):
+    def __init__(self, in_dim, window_size=8, heads=4, ff_dim=512):
         super().__init__()
+        self.window_size = window_size
         self.attn = nn.MultiheadAttention(embed_dim=in_dim, num_heads=heads, batch_first=True)
         self.ff = nn.Sequential(
             nn.Linear(in_dim, ff_dim),
@@ -110,17 +99,29 @@ class BlurAwareTransformerBlock(nn.Module):
 
     def forward(self, x, blur_map=None):
         B, C, H, W = x.shape
-        x_flat = x.view(B, C, -1).permute(0, 2, 1)
-        attn_out, _ = self.attn(x_flat, x_flat, x_flat)
+        ws = self.window_size
+        assert H % ws == 0 and W % ws == 0, f"Input must be divisible by window size {ws}, but got ({H}, {W})"
+
+        x = x.view(B, C, H // ws, ws, W // ws, ws)
+        x = x.permute(0, 2, 4, 3, 5, 1).contiguous().view(-1, ws * ws, C)
+
         if blur_map is not None:
             blur_resized = F.interpolate(blur_map, size=(H, W), mode='bilinear', align_corners=False)
-            blur_weight = blur_resized.view(B, 1, -1).permute(0, 2, 1)
-            attn_out = attn_out * (1 + blur_weight)
-        x = self.norm1(x_flat + attn_out)
-        x = self.norm2(x + self.ff(x))
-        return x.permute(0, 2, 1).view(B, C, H, W)
+            blur = blur_resized.view(B, 1, H // ws, ws, W // ws, ws)
+            blur = blur.permute(0, 2, 4, 3, 5, 1).contiguous().view(-1, ws * ws, 1)
 
-# ------------------- Light Decoder (Edge-Enhanced) ----------------------
+        attn_out, _ = self.attn(x, x, x)
+        if blur_map is not None:
+            attn_out = attn_out * (1 + blur)
+
+        x = self.norm1(x + attn_out)
+        x = self.norm2(x + self.ff(x))
+
+        x = x.view(B, H // ws, W // ws, ws, ws, C)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous().view(B, C, H, W)
+        return x
+
+# ------------------- Decoder ----------------------
 class LightEdgePreservingDecoder(nn.Module):
     def __init__(self, in_channels=256, skip_channels=32, mid_channels=64, out_channels=32):
         super().__init__()
@@ -142,14 +143,6 @@ class LightEdgePreservingDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # ➕ 新增第三次上采样：720→1080
-        self.up3 = nn.Sequential(
-            nn.Upsample(scale_factor=1.5, mode='bilinear', align_corners=False),  # 720 * 1.5 = 1080
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
         self.edge_mod = nn.Sequential(
             nn.Conv2d(out_channels, 8, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -167,7 +160,6 @@ class LightEdgePreservingDecoder(nn.Module):
             x = torch.cat([x, skip_feat], dim=1)
             x = self.fuse_skip(x)
         x = self.up2(x)
-        x = self.up3(x)  # ➕ 上采样至 1080
 
         edge = self.edge_mod(x)
         x = x * (1 + edge)
@@ -178,15 +170,24 @@ class LightEdgePreservingDecoder(nn.Module):
 
         return torch.sigmoid(self.out_conv(x))
 
-# ------------------- MatteRefiner Model ----------------------
+# ------------------- Full Refiner ----------------------
 class MatteRefiner(nn.Module):
-    def __init__(self):
+    def __init__(self, base_channels=64):
         super().__init__()
+        self.base_channels = base_channels
         self.blur_encoder = DefocusBlurEstimator()
-        self.shallow = ShallowAttentionEncoder()
-        self.encoder = WaveletUNetEncoder()
-        self.transformer = BlurAwareTransformerBlock(in_dim=256)
-        self.decoder = LightEdgePreservingDecoder()
+        self.shallow = ShallowAttentionEncoder(in_channels=4, base_channels=base_channels // 2)
+        self.encoder = WaveletUNetEncoder(in_channels=3, base_channels=base_channels)
+
+        encoder_out_channels = base_channels * 4
+        self.transformer = WindowedBlurTransformerBlock(in_dim=encoder_out_channels)
+
+        self.decoder = LightEdgePreservingDecoder(
+            in_channels=encoder_out_channels,
+            skip_channels=base_channels // 2,
+            mid_channels=base_channels,
+            out_channels=base_channels // 2
+        )
 
     def forward(self, rgb, m1):
         blur_map = self.blur_encoder(rgb)

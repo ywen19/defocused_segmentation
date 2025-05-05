@@ -1,24 +1,19 @@
-"""
-Training, validation and inference pipeline for our proposed MatteRefiner.
-"""
-
 import os
 import sys
 import json
 from PIL import Image
-
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from torchvision.transforms.functional import to_tensor, resize
-from PIL import Image
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
+
 from dataload.build_dataloaders import build_dataloaders
 from model.refiner import MatteRefiner
-from utils import compute_mae, compute_sad, compute_grad
+from utils import compute_mse, compute_sad, compute_grad, compute_conn
 from utils import matte_l1_loss, mask_guided_loss, edge_aware_loss
 
 
@@ -28,165 +23,147 @@ def write_log(log_path, data):
 
 
 def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
-                    print_interval=20, log_path="train_metrics.jsonl"):
+                    print_interval=20, log_path="train_metrics.jsonl", accum_steps=2):
     model.train()
     total_loss = 0
-    mae_total, sad_total, grad_total = 0, 0, 0
-    count = 0
+    mse_total, sad_total, grad_total, conn_total = 0.0, 0.0, 0.0, 0.0
+    sample_count = 0
 
+    optimizer.zero_grad()
     for i, batch in enumerate(loader):
         rgb, init_mask, gt = [x.to(device) for x in batch]
+        bs = rgb.size(0)
 
-        optimizer.zero_grad()
         with autocast():
             pred, attn = model(rgb, init_mask)
+            assert pred.shape == gt.shape, f"Pred shape {pred.shape} != GT shape {gt.shape}"
+
             loss_l1 = matte_l1_loss(pred, gt)
             loss_edge = edge_aware_loss(pred, gt)
-            if epoch <= 2:
-                loss_mask = mask_guided_loss(pred, init_mask)
-            else:
-                loss_mask = 0.0
+            loss_mask = mask_guided_loss(pred, init_mask) if epoch <= 2 else 0.0
             loss = loss_l1 + 0.5 * loss_edge + 0.3 * loss_mask
+            loss = loss / accum_steps  # scale loss
 
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
-        mae_total += compute_mae(pred, gt).item()
-        sad_total += compute_sad(pred, gt).item()
-        grad_total += compute_grad(pred, gt).item()
-        count += 1
+        if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * bs * accum_steps
+        mse_total += compute_mse(pred, gt).mean().item() * bs
+        sad_total += compute_sad(pred, gt, reduction='mean').item()
+        grad_total += compute_grad(pred, gt, reduction='mean').item() * bs
+        conn_total += compute_conn(pred, gt).mean().item() * bs
+        sample_count += bs
 
         if (i + 1) % print_interval == 0:
-            avg_loss = total_loss / count
-            avg_mae = mae_total / count
-            avg_sad = sad_total / count
-            avg_grad = grad_total / count
             print(f"[Train {i+1:04d}/{len(loader)}] "
-                  f"Loss: {avg_loss:.4f} | MAE: {avg_mae:.4f} | SAD: {avg_sad:.2f} | GRAD: {avg_grad:.4f}")
-
+                  f"Loss: {total_loss/sample_count:.4f} | "
+                  f"MSE: {mse_total/sample_count:.6f} | "
+                  f"SAD: {sad_total/sample_count:.2f} | "
+                  f"GRAD: {grad_total/sample_count:.4f} | "
+                  f"CONN: {conn_total/sample_count:.4f}")
             write_log(log_path, {
                 "epoch": epoch,
                 "step": i + 1,
-                "loss": avg_loss,
-                "mae": avg_mae,
-                "sad": avg_sad,
-                "grad": avg_grad,
+                "loss": total_loss / sample_count,
+                "mse": mse_total / sample_count,
+                "sad": sad_total / sample_count,
+                "grad": grad_total / sample_count,
+                "conn": conn_total / sample_count,
             })
 
 
-def val_one_epoch(model, loader, device, epoch,
-                  print_interval=20, log_path="val_metrics.jsonl"):
-    model.eval()
-    mae_total, sad_total, grad_total = 0, 0, 0
-    count = 0
-
-    with torch.no_grad():
-        for i, batch in enumerate(loader):
-            rgb, init_mask, gt = [x.to(device) for x in batch]
-
-            with autocast():
-                pred, attn = model(rgb, init_mask)
-                pred = torch.clamp(pred, 0, 1)
-
-            mae_total += compute_mae(pred, gt).item()
-            sad_total += compute_sad(pred, gt).item()
-            grad_total += compute_grad(pred, gt).item()
-            count += 1
-
-            if (i + 1) % print_interval == 0:
-                avg_mae = mae_total / count
-                avg_sad = sad_total / count
-                avg_grad = grad_total / count
-                print(f"[Val {i+1:04d}/{len(loader)}] "
-                      f"MAE: {avg_mae:.4f} | SAD: {avg_sad:.2f} | GRAD: {avg_grad:.4f}")
-
-                write_log(log_path, {
-                    "epoch": epoch,
-                    "step": i + 1,
-                    "mae": avg_mae,
-                    "sad": avg_sad,
-                    "grad": avg_grad,
-                })
-
-    return mae_total / count, sad_total / count, grad_total / count
-
-
 @torch.no_grad()
-def infer_single(model, rgb_path, mask_path, device, resize_to=(720, 1280)):
+def val_one_epoch(model, loader, device, epoch,
+                  print_interval=10, log_path="val_metrics.jsonl"):
     model.eval()
-    rgb = Image.open(rgb_path).convert("RGB")
-    mask = Image.open(mask_path).convert("L")
+    total_loss, mse_total, sad_total, grad_total, conn_total = 0.0, 0.0, 0.0, 0.0, 0.0
+    sample_count = 0
 
-    rgb = resize(rgb, resize_to)
-    mask = resize(mask, resize_to)
+    for i, batch in enumerate(loader):
+        rgb, init_mask, gt = [x.to(device) for x in batch]
+        bs = rgb.size(0)
 
-    rgb_tensor = to_tensor(rgb).unsqueeze(0).to(device)
-    mask_tensor = to_tensor(mask).unsqueeze(0).to(device)
+        with autocast():
+            pred, attn = model(rgb, init_mask)
+            pred = torch.clamp(pred, 0, 1)
+            loss = matte_l1_loss(pred, gt)
 
-    pred, _ = model(rgb_tensor, mask_tensor)
-    return pred.squeeze(0).cpu()
+        total_loss += loss.item() * bs
+        mse_total += compute_mse(pred, gt).mean().item() * bs
+        sad_total += compute_sad(pred, gt, reduction='mean').item()
+        grad_total += compute_grad(pred, gt, reduction='mean').item() * bs
+        conn_total += compute_conn(pred, gt).mean().item() * bs
+        sample_count += bs
+
+        if (i + 1) % print_interval == 0:
+            print(f"[Val {i+1:04d}/{len(loader)}] "
+                  f"Loss: {total_loss/sample_count:.4f} | "
+                  f"MSE: {mse_total/sample_count:.6f} | "
+                  f"SAD: {sad_total/sample_count:.2f} | "
+                  f"GRAD: {grad_total/sample_count:.4f} | "
+                  f"CONN: {conn_total/sample_count:.4f}")
+            write_log(log_path, {
+                "epoch": epoch,
+                "step": i + 1,
+                "loss": total_loss / sample_count,
+                "mse": mse_total / sample_count,
+                "sad": sad_total / sample_count,
+                "grad": grad_total / sample_count,
+                "conn": conn_total / sample_count,
+            })
+
+    return (
+        total_loss / sample_count,
+        mse_total / sample_count,
+        sad_total / sample_count,
+        grad_total / sample_count,
+        conn_total / sample_count,
+    )
 
 
 def main():
-    # ---------- Config ----------
     config = {
-        "num_epochs": 3,
+        "num_epochs": 1,
         "batch_size": 4,
         "print_interval": 20,
         "checkpoint_dir": "checkpoints",
-        "csv_path": "../data/pair_for_refiner.csv",  # TODO: Set correct path
-        "resize_to": (720, 1280),
-        "num_workers": 4,
+        "csv_path": "../data/pair_for_refiner.csv",
+        "resize_to": (1088, 1920),
+        "num_workers": 6,
         "lr": 1e-4,
         "weight_decay": 1e-4,
+        "base_channel": 48,
+        "sample_fraction": 0.05,
     }
 
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---------- Data ----------
     train_loader, val_loader = build_dataloaders(
         csv_path=config["csv_path"],
         resize_to=config["resize_to"],
         batch_size=config["batch_size"],
-        num_workers=config["num_workers"]
+        num_workers=config["num_workers"],
+        sample_fraction=config["sample_fraction"],
     )
 
-    # ---------- Model ----------
-    model = MatteRefiner().to(device)
-
-    # ---------- Optimizer & Scaler ----------
+    model = MatteRefiner(base_channels=config['base_channel']).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
     scaler = GradScaler()
 
-    # ---------- Training Loop ----------
     for epoch in range(1, config["num_epochs"] + 1):
         print(f"\n--- Epoch {epoch}/{config['num_epochs']} ---")
-        train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            epoch=epoch,
-            print_interval=config["print_interval"],
-            log_path="train_metrics.jsonl"
-        )
+        train_one_epoch(model, train_loader, optimizer, scaler, device, epoch, accum_steps=2)
+        val_loss, val_mse, val_sad, val_grad, val_conn = val_one_epoch(model, val_loader, device, epoch)
 
-        val_mae, val_sad, val_grad = val_one_epoch(
-            model=model,
-            loader=val_loader,
-            device=device,
-            epoch=epoch,
-            print_interval=config["print_interval"],
-            log_path="val_metrics.jsonl"
-        )
+        print(f"Validation Metrics: "
+              f"Loss={val_loss:.4f} | MSE={val_mse:.6f} | "
+              f"SAD={val_sad:.2f} | GRAD={val_grad:.4f} | CONN={val_conn:.4f}")
 
-        print(f"Validation Metrics: MAE={val_mae:.4f} | SAD={val_sad:.2f} | GRAD={val_grad:.4f}")
-
-        # Save checkpoint
         ckpt_path = os.path.join(config["checkpoint_dir"], f"refiner_epoch{epoch}.pth")
         torch.save(model.state_dict(), ckpt_path)
         print(f"Checkpoint saved to {ckpt_path}")

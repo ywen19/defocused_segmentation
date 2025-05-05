@@ -173,3 +173,4 @@ sam2/
 segment-anything/
 .ipynb_checkpoints/
 *.pth
+*.jsonl

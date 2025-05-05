@@ -8,7 +8,8 @@ def build_dataloaders(
     num_workers=4,
     split_ratio=0.8,
     seed=42,
-    shuffle=True
+    shuffle=True,
+    sample_fraction=0.1  # 新增参数：取样比例
 ):
     """
     Build training and validation DataLoaders using TorchData IterableDataPipes.
@@ -21,12 +22,17 @@ def build_dataloaders(
         split_ratio (float): Ratio of training set split (default 0.8 = 80% train, 20% val).
         seed (int): Random seed for reproducibility.
         shuffle (bool): Whether to shuffle training samples.
+        sample_fraction (float): Fraction of data to keep for testing learning behavior.
 
     Returns:
         train_loader, val_loader: PyTorch DataLoaders
     """
     # Split CSV into train and val sample lists
     train_rows, val_rows = split_csv(csv_path, split_ratio=split_ratio, seed=seed)
+
+    # >>>> 只保留 sample_fraction 比例的数据 <<<<
+    train_rows = train_rows[:max(1, int(len(train_rows) * sample_fraction))]
+    val_rows = val_rows[:max(1, int(len(val_rows) * sample_fraction))]
 
     # Build separate iterable pipelines
     train_pipe = build_iterable_datapipe(train_rows, resize_to=resize_to, shuffle=shuffle)
