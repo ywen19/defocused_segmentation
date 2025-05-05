@@ -12,6 +12,7 @@ dependencies:
   - pip:
       - torch>=2.5.1 --index-url https://download.pytorch.org/whl/cu124
       - torchvision>=0.20.1 --index-url https://download.pytorch.org/whl/cu124
+      - torchdata==0.7.1 --index-url https://download.pytorch.org/whl/cu124
       - numpy>=1.24.4
       - opencv-python==4.10.0.84
       - matplotlib>=3.9.2
