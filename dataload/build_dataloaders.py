@@ -1,5 +1,5 @@
 from torch.utils.data import DataLoader
-from data_pipe import split_csv, build_iterable_datapipe
+from dataload.data_pipe import split_csv, build_iterable_datapipe
 
 def build_dataloaders(
     csv_path: str,

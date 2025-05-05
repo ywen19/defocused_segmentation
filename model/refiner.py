@@ -125,25 +125,38 @@ class LightEdgePreservingDecoder(nn.Module):
     def __init__(self, in_channels=256, skip_channels=32, mid_channels=64, out_channels=32):
         super().__init__()
         self.reduce = nn.Conv2d(in_channels, mid_channels, kernel_size=1)
+
         self.up1 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(mid_channels, mid_channels, 3, padding=1),
             nn.BatchNorm2d(mid_channels),
             nn.ReLU(inplace=True)
         )
+
         self.fuse_skip = nn.Conv2d(mid_channels + skip_channels, mid_channels, 3, padding=1)
+
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(mid_channels, out_channels, 3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
+
+        # ➕ 新增第三次上采样：720→1080
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=1.5, mode='bilinear', align_corners=False),  # 720 * 1.5 = 1080
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
         self.edge_mod = nn.Sequential(
             nn.Conv2d(out_channels, 8, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(8, 1, 1),
             nn.Sigmoid()
         )
+
         self.out_conv = nn.Conv2d(out_channels, 1, kernel_size=1)
 
     def forward(self, x, attention=None, skip_feat=None):
@@ -154,11 +167,15 @@ class LightEdgePreservingDecoder(nn.Module):
             x = torch.cat([x, skip_feat], dim=1)
             x = self.fuse_skip(x)
         x = self.up2(x)
+        x = self.up3(x)  # ➕ 上采样至 1080
+
         edge = self.edge_mod(x)
         x = x * (1 + edge)
+
         if attention is not None:
             att = F.interpolate(attention, size=x.shape[2:], mode='bilinear', align_corners=False)
             x = x * (1 + att)
+
         return torch.sigmoid(self.out_conv(x))
 
 # ------------------- MatteRefiner Model ----------------------
