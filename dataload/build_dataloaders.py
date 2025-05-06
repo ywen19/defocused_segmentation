@@ -3,20 +3,20 @@ from dataload.data_pipe import split_csv, build_iterable_datapipe
 
 def build_dataloaders(
     csv_path: str,
-    resize_to=(720, 1280),
+    resize_to=(736, 1280),
     batch_size=4,
     num_workers=4,
     split_ratio=0.8,
     seed=42,
     shuffle=True,
-    sample_fraction=0.1  # 新增参数：取样比例
+    sample_fraction=1.0
 ):
     """
     Build training and validation DataLoaders using TorchData IterableDataPipes.
 
     Args:
         csv_path (str): Path to the CSV file containing rgb, gt, init_mask columns.
-        resize_to (tuple): Resize all images to this resolution.
+        resize_to (tuple): Resize all images to this resolution (H, W).
         batch_size (int): Batch size for DataLoader.
         num_workers (int): Number of workers for DataLoader.
         split_ratio (float): Ratio of training set split (default 0.8 = 80% train, 20% val).
@@ -27,18 +27,19 @@ def build_dataloaders(
     Returns:
         train_loader, val_loader: PyTorch DataLoaders
     """
-    # Split CSV into train and val sample lists
+
+    # Step 1: Split data
     train_rows, val_rows = split_csv(csv_path, split_ratio=split_ratio, seed=seed)
 
-    # >>>> 只保留 sample_fraction 比例的数据 <<<<
+    # Step 2: Apply sampling
     train_rows = train_rows[:max(1, int(len(train_rows) * sample_fraction))]
     val_rows = val_rows[:max(1, int(len(val_rows) * sample_fraction))]
 
-    # Build separate iterable pipelines
+    # Step 3: Build Iterable DataPipes
     train_pipe = build_iterable_datapipe(train_rows, resize_to=resize_to, shuffle=shuffle)
     val_pipe = build_iterable_datapipe(val_rows, resize_to=resize_to, shuffle=False)
 
-    # Wrap in DataLoader
+    # Step 4: Wrap in DataLoader
     train_loader = DataLoader(train_pipe, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_pipe, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
 

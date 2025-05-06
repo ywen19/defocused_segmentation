@@ -168,7 +168,7 @@ class LightEdgePreservingDecoder(nn.Module):
             att = F.interpolate(attention, size=x.shape[2:], mode='bilinear', align_corners=False)
             x = x * (1 + att)
 
-        return torch.sigmoid(self.out_conv(x))
+        return torch.sigmoid(self.out_conv(x)), x
 
 # ------------------- Full Refiner ----------------------
 class MatteRefiner(nn.Module):
@@ -189,11 +189,22 @@ class MatteRefiner(nn.Module):
             out_channels=base_channels // 2
         )
 
+        self.contrastive_head = nn.Sequential(
+            nn.Conv2d(encoder_out_channels, base_channels * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels, 3, padding=1),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(base_channels, base_channels)
+        )
+
     def forward(self, rgb, m1):
         blur_map = self.blur_encoder(rgb)
         x = torch.cat([rgb, m1], dim=1)
         shallow_feat, attn = self.shallow(x, blur_map=blur_map)
         enc_feat = self.encoder(rgb)
         trans_feat = self.transformer(enc_feat, blur_map=blur_map)
-        alpha = self.decoder(trans_feat, attention=attn, skip_feat=shallow_feat)
-        return alpha, attn
+        alpha, final_feat = self.decoder(trans_feat, attention=attn, skip_feat=shallow_feat)
+        alpha = F.interpolate(alpha, size=rgb.shape[2:], mode='bilinear', align_corners=False)
+        contrastive_feat = self.contrastive_head(trans_feat)
+        return alpha, attn, trans_feat, enc_feat, contrastive_feat

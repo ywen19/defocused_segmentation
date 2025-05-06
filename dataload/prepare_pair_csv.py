@@ -1,10 +1,7 @@
-"""
-We prepare the csv for: rgb--yolo+sam2 mask--groundtruth matte for batch loading.
-"""
-
 import os
 import csv
 import argparse
+import random
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
@@ -17,7 +14,7 @@ def is_all_black(image_path):
     except:
         return True
 
-def generate_csv(data_root, output_csv):
+def generate_csv(data_root, output_csv, sample_percent):
     fgr_dir = os.path.join(data_root, 'fgr')
     alpha_dir = os.path.join(data_root, 'alpha')
 
@@ -33,7 +30,11 @@ def generate_csv(data_root, output_csv):
         if not (os.path.isdir(fgr_rgb_dir) and os.path.isdir(fgr_mask_dir) and os.path.isdir(gt_dir)):
             continue
 
-        for fname in sorted(os.listdir(fgr_mask_dir)):
+        all_fnames = sorted(os.listdir(fgr_mask_dir))
+        sample_count = max(1, int(len(all_fnames) * (sample_percent / 100.0)))
+        sampled_fnames = random.sample(all_fnames, sample_count)
+
+        for fname in sampled_fnames:
             total_masks += 1
 
             rgb = os.path.join(fgr_rgb_dir, fname)
@@ -46,7 +47,7 @@ def generate_csv(data_root, output_csv):
 
             raw_rows.append({'rgb': rgb, 'gt': gt, 'init_mask': init_mask})
 
-    print(f"\n📦 Total masks found: {total_masks}")
+    print(f"\n📦 Total masks considered ({sample_percent}% sampled): {total_masks}")
     print(f"❌ Skipped due to missing RGB/GT: {missing_pairs}")
     print(f"🔍 Valid candidate samples for further check: {len(raw_rows)}")
 
@@ -62,7 +63,6 @@ def generate_csv(data_root, output_csv):
                 skipped_black += 1
                 continue
 
-            # Load and verify size
             rgb_img = Image.open(rgb)
             gt_img = Image.open(gt)
             mask_img = Image.open(mask)
@@ -88,11 +88,13 @@ def generate_csv(data_root, output_csv):
     print(f"\n📁 CSV saved to: {output_csv}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Generate and validate CSV for matte training.")
+    parser = argparse.ArgumentParser(description="Generate and validate CSV for matte training (percentage sampled per sequence).")
     parser.add_argument('--data_root', type=str, default='../data/video_defocused_processed/train',
                         help="Root folder containing 'fgr' and 'alpha'")
     parser.add_argument('--output_csv', type=str, default='../data/pair_for_refiner.csv',
                         help="Path to output CSV file")
+    parser.add_argument('--percent', type=float, default=5.0,
+                        help="Percentage of data to sample from each sequence")
 
     args = parser.parse_args()
-    generate_csv(args.data_root, args.output_csv)
+    generate_csv(args.data_root, args.output_csv, args.percent)

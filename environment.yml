@@ -42,3 +42,4 @@ dependencies:
       - git+https://github.com/cheind/py-thin-plate-spline
       - "imageio>=2.33,!=2.35.0"
       - ultralytics
+      - kornia>=0.7.1  # ✅ Add Kornia here

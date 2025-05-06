@@ -1,26 +1,25 @@
 import os
 import sys
 import json
-from PIL import Image
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
-from torchvision.transforms.functional import to_tensor, resize
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from dataload.build_dataloaders import build_dataloaders
 from model.refiner import MatteRefiner
-from utils import compute_mse, compute_sad, compute_grad, compute_conn
-from utils import matte_l1_loss, mask_guided_loss, edge_aware_loss
-
+from utils import (
+    compute_mse, compute_sad, compute_grad, compute_conn,
+    contrastive_loss, closed_form_matting_loss,
+    gradient_preserving_loss
+)
 
 def write_log(log_path, data):
     with open(log_path, "a") as f:
         f.write(json.dumps(data) + "\n")
-
 
 def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
                     print_interval=20, log_path="train_metrics.jsonl", accum_steps=2):
@@ -35,14 +34,35 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
         bs = rgb.size(0)
 
         with autocast():
-            pred, attn = model(rgb, init_mask)
-            assert pred.shape == gt.shape, f"Pred shape {pred.shape} != GT shape {gt.shape}"
+            pred, attn, trans_feat, enc_feat, contrastive_feat = model(rgb, init_mask)
+            pred_sigmoid = torch.sigmoid(pred)
 
-            loss_l1 = matte_l1_loss(pred, gt)
-            loss_edge = edge_aware_loss(pred, gt)
-            loss_mask = mask_guided_loss(pred, init_mask) if epoch <= 2 else 0.0
-            loss = loss_l1 + 0.5 * loss_edge + 0.3 * loss_mask
-            loss = loss / accum_steps  # scale loss
+            loss_cf = closed_form_matting_loss(pred_sigmoid, rgb, gt_alpha=gt)
+            loss_grad = gradient_preserving_loss(pred_sigmoid, gt)
+            loss_conn = compute_conn(pred_sigmoid, gt).mean()
+            loss_sad = compute_sad(pred_sigmoid, gt, reduction='mean')
+
+            with torch.no_grad():
+                fg_mask = (gt > 0.95).float()
+                bg_mask = (gt < 0.05).float()
+                fg_mask = F.interpolate(fg_mask, size=trans_feat.shape[2:], mode='nearest')
+                bg_mask = F.interpolate(bg_mask, size=trans_feat.shape[2:], mode='nearest')
+                pos_feat = (trans_feat * fg_mask).sum(dim=[2, 3]) / (fg_mask.sum(dim=[2, 3]) + 1e-6)
+                neg_feat = (trans_feat * bg_mask).sum(dim=[2, 3]) / (bg_mask.sum(dim=[2, 3]) + 1e-6)
+
+            pred_feat = F.normalize(contrastive_feat, dim=1)
+
+            # Project pos/neg features using the same head
+            pos_feat = model.contrastive_head(pos_feat.unsqueeze(-1).unsqueeze(-1))
+            neg_feat = model.contrastive_head(neg_feat.unsqueeze(-1).unsqueeze(-1))
+
+            pos_feat = F.normalize(pos_feat, dim=1)
+            neg_feat = F.normalize(neg_feat, dim=1)
+
+            loss_ctr = contrastive_loss(pred_feat, pos_feat, neg_feat)
+
+            loss = (1.0 * loss_cf + 0.5 * loss_grad + 2.0 * loss_ctr + 0.5 * loss_conn + 1.0 * loss_sad)
+            loss = loss / accum_steps
 
         scaler.scale(loss).backward()
 
@@ -52,10 +72,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
             optimizer.zero_grad()
 
         total_loss += loss.item() * bs * accum_steps
-        mse_total += compute_mse(pred, gt).mean().item() * bs
-        sad_total += compute_sad(pred, gt, reduction='mean').item()
-        grad_total += compute_grad(pred, gt, reduction='mean').item() * bs
-        conn_total += compute_conn(pred, gt).mean().item() * bs
+        mse_total += compute_mse(pred_sigmoid, gt).mean().item() * bs
+        sad_total += loss_sad.item() * bs
+        grad_total += compute_grad(pred_sigmoid, gt).item() * bs
+        conn_total += compute_conn(pred_sigmoid, gt).mean().item() * bs
         sample_count += bs
 
         if (i + 1) % print_interval == 0:
@@ -64,7 +84,9 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
                   f"MSE: {mse_total/sample_count:.6f} | "
                   f"SAD: {sad_total/sample_count:.2f} | "
                   f"GRAD: {grad_total/sample_count:.4f} | "
-                  f"CONN: {conn_total/sample_count:.4f}")
+                  f"CONN: {conn_total/sample_count:.4f} | "
+                  f"CF: {loss_cf.item():.4f} | GRAD_L: {loss_grad.item():.4f} | "
+                  f"CTR: {loss_ctr.item():.4f} | CONN_Loss: {loss_conn.item():.4f} | SAD_Loss: {loss_sad.item():.4f}")
             write_log(log_path, {
                 "epoch": epoch,
                 "step": i + 1,
@@ -73,8 +95,12 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
                 "sad": sad_total / sample_count,
                 "grad": grad_total / sample_count,
                 "conn": conn_total / sample_count,
+                "loss_cf": loss_cf.item(),
+                "loss_grad": loss_grad.item(),
+                "loss_ctr": loss_ctr.item(),
+                "loss_conn": loss_conn.item(),
+                "loss_sad": loss_sad.item()
             })
-
 
 @torch.no_grad()
 def val_one_epoch(model, loader, device, epoch,
@@ -88,15 +114,17 @@ def val_one_epoch(model, loader, device, epoch,
         bs = rgb.size(0)
 
         with autocast():
-            pred, attn = model(rgb, init_mask)
-            pred = torch.clamp(pred, 0, 1)
-            loss = matte_l1_loss(pred, gt)
+            pred, attn, _, _, _ = model(rgb, init_mask)
+            pred_sigmoid = torch.sigmoid(pred)
+            loss_cf = closed_form_matting_loss(pred_sigmoid, rgb, gt_alpha=gt)
+            loss_grad = gradient_preserving_loss(pred_sigmoid, gt)
+            loss = 1.0 * loss_cf + 0.5 * loss_grad
 
         total_loss += loss.item() * bs
-        mse_total += compute_mse(pred, gt).mean().item() * bs
-        sad_total += compute_sad(pred, gt, reduction='mean').item()
-        grad_total += compute_grad(pred, gt, reduction='mean').item() * bs
-        conn_total += compute_conn(pred, gt).mean().item() * bs
+        mse_total += compute_mse(pred_sigmoid, gt).mean().item() * bs
+        sad_total += compute_sad(pred_sigmoid, gt, reduction='mean').item() * bs
+        grad_total += compute_grad(pred_sigmoid, gt).item() * bs
+        conn_total += compute_conn(pred_sigmoid, gt).mean().item() * bs
         sample_count += bs
 
         if (i + 1) % print_interval == 0:
@@ -105,7 +133,8 @@ def val_one_epoch(model, loader, device, epoch,
                   f"MSE: {mse_total/sample_count:.6f} | "
                   f"SAD: {sad_total/sample_count:.2f} | "
                   f"GRAD: {grad_total/sample_count:.4f} | "
-                  f"CONN: {conn_total/sample_count:.4f}")
+                  f"CONN: {conn_total/sample_count:.4f} | "
+                  f"CF: {loss_cf.item():.4f} | GRAD_L: {loss_grad.item():.4f}")
             write_log(log_path, {
                 "epoch": epoch,
                 "step": i + 1,
@@ -114,6 +143,8 @@ def val_one_epoch(model, loader, device, epoch,
                 "sad": sad_total / sample_count,
                 "grad": grad_total / sample_count,
                 "conn": conn_total / sample_count,
+                "loss_cf": loss_cf.item(),
+                "loss_grad": loss_grad.item()
             })
 
     return (
@@ -124,20 +155,19 @@ def val_one_epoch(model, loader, device, epoch,
         conn_total / sample_count,
     )
 
-
 def main():
     config = {
         "num_epochs": 1,
-        "batch_size": 4,
+        "batch_size": 2,
         "print_interval": 20,
         "checkpoint_dir": "checkpoints",
         "csv_path": "../data/pair_for_refiner.csv",
-        "resize_to": (1088, 1920),
+        "resize_to": (736, 1280),
         "num_workers": 6,
         "lr": 1e-4,
         "weight_decay": 1e-4,
         "base_channel": 48,
-        "sample_fraction": 0.05,
+        "sample_fraction": 1.0,
     }
 
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
@@ -157,7 +187,7 @@ def main():
 
     for epoch in range(1, config["num_epochs"] + 1):
         print(f"\n--- Epoch {epoch}/{config['num_epochs']} ---")
-        train_one_epoch(model, train_loader, optimizer, scaler, device, epoch, accum_steps=2)
+        train_one_epoch(model, train_loader, optimizer, scaler, device, epoch, accum_steps=4)
         val_loss, val_mse, val_sad, val_grad, val_conn = val_one_epoch(model, val_loader, device, epoch)
 
         print(f"Validation Metrics: "
@@ -167,7 +197,6 @@ def main():
         ckpt_path = os.path.join(config["checkpoint_dir"], f"refiner_epoch{epoch}.pth")
         torch.save(model.state_dict(), ckpt_path)
         print(f"Checkpoint saved to {ckpt_path}")
-
 
 if __name__ == "__main__":
     main()
