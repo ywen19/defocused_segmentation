@@ -1,247 +1,284 @@
 import torch
-import torchvision.transforms as T
-from PIL import Image
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from PIL import Image
+import torchvision.transforms as T
 import numpy as np
 
-
-def get_gradient(tensor):
+def connected_components(bin_map):
     """
-    使用 Sobel 样式卷积计算梯度，保持输入输出尺寸一致。
+    Basic 4-connectivity connected components labeling for binary numpy array.
+    Returns labeled map and number of labels.
     """
-    kernel_x = torch.tensor([[1, 0, -1],
-                             [2, 0, -2],
-                             [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3)
-    kernel_y = torch.tensor([[1, 2, 1],
-                             [0, 0, 0],
-                             [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+    H, W = bin_map.shape
+    labeled = np.zeros_like(bin_map, dtype=np.int32)
+    label_id = 0
+    for i in range(H):
+        for j in range(W):
+            if bin_map[i, j] and labeled[i, j] == 0:
+                label_id += 1
+                # BFS flood fill
+                stack = [(i, j)]
+                labeled[i, j] = label_id
+                while stack:
+                    x, y = stack.pop()
+                    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < H and 0 <= ny < W and bin_map[nx, ny] and labeled[nx, ny] == 0:
+                            labeled[nx, ny] = label_id
+                            stack.append((nx, ny))
+    return labeled, label_id
 
-    kernel_x = kernel_x.to(tensor.device)
-    kernel_y = kernel_y.to(tensor.device)
+from utils import (
+    extract_unknown_mask,
+    compute_cf_loss,
+    compute_grad_loss_soft_only,
+    compute_conn_mismatch_loss,
+    compute_sad_with_trimap,
+    compute_ctr_loss,
+    compute_mse_with_trimap,
+    compute_grad_metric,
+    compute_conn_with_unknown_mask
+)
 
-    grad_x = F.conv2d(tensor, kernel_x, padding=1)
-    grad_y = F.conv2d(tensor, kernel_y, padding=1)
-    return grad_x.abs(), grad_y.abs()
+
+def show_mask_region(title, mask_tensor):
+    mask_np = mask_tensor.squeeze().detach().cpu().numpy()
+    plt.imshow(mask_np, cmap='jet')
+    plt.title(title)
+    plt.axis("off")
 
 
-def visualize_grad_loss_region(gt_alpha, coarse_mask=None, lower=0.05, upper=0.95):
-    """
-    可视化 gradient loss 在由 GT alpha 定义的 soft matte 区域的作用。
-    """
-    gt_alpha = gt_alpha.clone()
-    if coarse_mask is None:
-        coarse_mask = gt_alpha  # fallback
+# === Loss 可视化 ===
 
-    # 仅使用 GT 决定 soft 区域（这样对 edge 模糊有更好体现）
+def visualize_cf_loss_region(gt_alpha, pred_alpha, trimap=None):
+    lower, upper = 0.05, 0.95
     soft_mask = ((gt_alpha > lower) & (gt_alpha < upper)).float()
+    if trimap is not None:
+        unknown = extract_unknown_mask(trimap)
+        soft_mask *= unknown
+    loss_map = ((pred_alpha - gt_alpha) ** 2) * soft_mask
 
-    # 梯度图必须在 full gt_alpha 上计算，再用 soft mask 提取目标区域
-    grad_x_all, grad_y_all = get_gradient(gt_alpha)
-    grad_x = grad_x_all * soft_mask
-    grad_y = grad_y_all * soft_mask
-
-    # 可视化
-    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
-    axes[0].imshow(gt_alpha.squeeze().cpu().numpy(), cmap='gray')
-    axes[0].set_title("GT Alpha")
-
-    axes[1].imshow(coarse_mask.squeeze().cpu().numpy(), cmap='gray')
-    axes[1].set_title("Coarse Mask")
-
-    axes[2].imshow(grad_x.squeeze().cpu().numpy(), cmap='viridis')
-    axes[2].set_title("Grad X (GT Soft Region)")
-
-    axes[3].imshow(grad_y.squeeze().cpu().numpy(), cmap='viridis')
-    axes[3].set_title("Grad Y (GT Soft Region)")
-
-    for ax in axes:
-        ax.axis('off')
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 2, 1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2, 2, 2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2, 2, 3)
+    show_mask_region("CF Mask", soft_mask)
+    plt.subplot(2, 2, 4)
+    show_mask_region("CF Loss Map", loss_map)
     plt.tight_layout()
     plt.show()
 
 
-def visualize_cf_loss_region(gt_alpha, pred_alpha, lower=0.05, upper=0.95):
-    """
-    可视化 CF Loss 的监督区域和误差分布，仅在 soft matte 区域内。
-    """
-    def create_soft_mask(gt_alpha, lower=0.05, upper=0.95):
-        return ((gt_alpha > lower) & (gt_alpha < upper)).float()
+def visualize_grad_loss_region(gt_alpha, pred_alpha, coarse_mask=None):
+    def get_gradient(x):
+        kx = torch.tensor([[1, 0, -1],
+                           [2, 0, -2],
+                           [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3).to(x.device)
+        ky = torch.tensor([[1, 2, 1],
+                           [0, 0, 0],
+                           [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3).to(x.device)
+        gx = F.conv2d(x, kx, padding=1)
+        gy = F.conv2d(x, ky, padding=1)
+        return gx, gy
 
-    def compute_cf_loss(pred, target, mask, eps=1e-6):
-        # 计算平方差
-        loss_map = (pred - target) ** 2
-        masked_loss = loss_map * mask
-        loss_mean = masked_loss.sum() / (mask.sum() + eps)
-        return masked_loss.squeeze(0).squeeze(0).detach(), loss_mean.item()
-
-    # 创建 soft matte 区域掩码
-    soft_mask = create_soft_mask(gt_alpha, lower, upper)
-
-    # 计算 CF Loss 误差图（仅在 soft 区域）
-    loss_map, loss_value = compute_cf_loss(pred_alpha, gt_alpha, soft_mask)
-
-    # 可视化
-    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
-    axes[0].imshow(gt_alpha.squeeze().numpy(), cmap='gray')
-    axes[0].set_title("GT Alpha")
-
-    axes[1].imshow(pred_alpha.squeeze().numpy(), cmap='gray')
-    axes[1].set_title("Pred Alpha")
-
-    axes[2].imshow(soft_mask.squeeze().numpy(), cmap='hot')
-    axes[2].set_title("Soft Matte Region")
-
-    axes[3].imshow(loss_map.numpy(), cmap='inferno')
-    axes[3].set_title(f"CF Loss (Soft Region)\nMean: {loss_value:.4f}")
-
-    for ax in axes:
-        ax.axis('off')
-    plt.tight_layout()
-    plt.show()
-
-def visualize_ctr_loss_region(gt_alpha, coarse_mask=None, lower=0.05, upper=0.95):
-    """
-    可视化 CTR Loss 监督的 soft 区域（GT 决定 + optional coarse mask refine）
-    """
-    # soft 区域：GT 决定
+    eps = 1e-6
+    lower, upper = 0.05, 0.95
     soft_mask = ((gt_alpha > lower) & (gt_alpha < upper)).float()
     if coarse_mask is not None:
         soft_mask *= ((coarse_mask > lower) & (coarse_mask < upper)).float()
 
-    # 可视化
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    axes[0].imshow(gt_alpha.squeeze().numpy(), cmap='gray')
-    axes[0].set_title("GT Alpha")
+    pred_gx, pred_gy = get_gradient(pred_alpha)
+    gt_gx, gt_gy     = get_gradient(gt_alpha)
 
-    axes[1].imshow(coarse_mask.squeeze().numpy(), cmap='gray')
-    axes[1].set_title("Coarse Mask")
+    edge_strength = torch.sqrt(gt_gx ** 2 + gt_gy ** 2 + eps)
+    edge_weight = edge_strength / (edge_strength.max() + eps)
+    weighted_mask = soft_mask * edge_weight
 
-    axes[2].imshow(soft_mask.squeeze().numpy(), cmap='hot')
-    axes[2].set_title("CTR Loss Region (Soft, Refined)")
+    diff_map = (torch.abs(pred_gx - gt_gx) + torch.abs(pred_gy - gt_gy)) / 2.0
+    masked_map = diff_map * weighted_mask
 
-    for ax in axes:
-        ax.axis('off')
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 2, 1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2, 2, 2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2, 2, 3)
+    show_mask_region("Grad Weighted Mask", weighted_mask)
+    plt.subplot(2, 2, 4)
+    show_mask_region("Grad Loss Map", masked_map)
     plt.tight_layout()
     plt.show()
 
 
-def visualize_ctr_loss_region(gt_alpha, pred_alpha=None, coarse_mask=None, threshold=0.5):
-    """
-    可视化 CTR Loss 监督区域（用于粗粒度的区域修正，不使用 soft matte 掩码）。
-    """
-    # 二值化 GT 和 coarse mask（或 prediction）
-    gt_binary = (gt_alpha > threshold).float()
-    
-    if pred_alpha is None and coarse_mask is None:
-        raise ValueError("必须提供 pred_alpha 或 coarse_mask 之一用于比较")
-
-    pred_binary = (pred_alpha if pred_alpha is not None else coarse_mask) > threshold
-    pred_binary = pred_binary.float()
-
-    # 差异区域（预测与 GT 不一致的位置）
-    diff = torch.abs(pred_binary - gt_binary)
-
-    # 可视化
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-
-    axes[0].imshow(gt_alpha.squeeze().numpy(), cmap='gray')
-    axes[0].set_title("GT Alpha")
-
-    if coarse_mask is not None:
-        axes[1].imshow(coarse_mask.squeeze().numpy(), cmap='gray')
-        axes[1].set_title("Coarse Mask")
-    else:
-        axes[1].imshow(pred_alpha.squeeze().numpy(), cmap='gray')
-        axes[1].set_title("Prediction")
-
-    axes[2].imshow(diff.squeeze().numpy(), cmap='hot')
-    axes[2].set_title("CTR Loss Region (Binary Diff)")
-
-    for ax in axes:
-        ax.axis('off')
-    plt.tight_layout()
-    plt.show()
-
-
-def get_conn_map(alpha, threshold=0.5):
-    """
-    获取 alpha matte 的连通性 map（二值+连通区域标记）
-    """
-    alpha_np = alpha.squeeze().cpu().numpy()
-    binary = (alpha_np > threshold).astype(np.uint8)
-    labeled = label(binary, connectivity=1)
-    return binary, labeled
-
-def visualize_conn_loss_region_simple(gt_alpha, pred_alpha, threshold=0.5):
-    """
-    简化版的 Conn Loss 可视化：比较 GT 和预测的连通区域差异（不使用 skimage）。
-    """
-    # 二值化处理
+def visualize_conn_loss_region(gt_alpha, pred_alpha, threshold=0.5):
     gt_bin = (gt_alpha > threshold).float()
     pred_bin = (pred_alpha > threshold).float()
-
-    # 差异区域：GT 是前景但 Pred 不是，或者 Pred 是前景但 GT 不是
     mismatch = torch.abs(gt_bin - pred_bin)
+    bce_map = F.binary_cross_entropy(pred_alpha, gt_bin, reduction='none') * mismatch
 
-    # 可视化
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    axes[0].imshow(gt_alpha.squeeze().numpy(), cmap='gray')
-    axes[0].set_title("GT Alpha")
-
-    axes[1].imshow(pred_alpha.squeeze().numpy(), cmap='gray')
-    axes[1].set_title("Pred Alpha")
-
-    axes[2].imshow(gt_bin.squeeze().numpy(), cmap='gray')
-    axes[2].set_title("GT Binary Mask")
-
-    axes[3].imshow(mismatch.squeeze().numpy(), cmap='hot')
-    axes[3].set_title("Mismatch (Conn Loss Region)")
-
-    for ax in axes:
-        ax.axis('off')
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 2, 1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2, 2, 2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2, 2, 3)
+    show_mask_region("Conn Mismatch", mismatch)
+    plt.subplot(2, 2, 4)
+    show_mask_region("Conn Loss Map", bce_map)
     plt.tight_layout()
     plt.show()
+
 
 def visualize_sad_loss_region(gt_alpha, pred_alpha):
-    """
-    可视化 SAD Loss 区域：直接展示预测与 GT 的逐像素绝对差。
-    """
-    # 计算 SAD 误差图
+    # 使用 soft 区域替代 trimap
+    soft_mask = ((gt_alpha > 0.1) & (gt_alpha < 0.9)).float()
     abs_diff = torch.abs(pred_alpha - gt_alpha)
+    loss_map = abs_diff * soft_mask
 
-    # 可视化
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].imshow(gt_alpha.squeeze().numpy(), cmap='gray')
-    axes[0].set_title("GT Alpha")
-
-    axes[1].imshow(pred_alpha.squeeze().numpy(), cmap='gray')
-    axes[1].set_title("Pred Alpha")
-
-    axes[2].imshow(abs_diff.squeeze().numpy(), cmap='hot')
-    axes[2].set_title("SAD Loss Map (|Pred - GT|)")
-
-    for ax in axes:
-        ax.axis('off')
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 2, 1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2, 2, 2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2, 2, 3)
+    show_mask_region("SAD Soft Mask", soft_mask)
+    plt.subplot(2, 2, 4)
+    show_mask_region("SAD Loss Map", loss_map)
     plt.tight_layout()
     plt.show()
 
 
+def visualize_ctr_loss_region(gt_alpha, pred_alpha, threshold=0.5):
+    gt_bin = (gt_alpha > threshold).float()
+    pred_bin = (pred_alpha > threshold).float()
+    diff_mask = torch.abs(gt_bin - pred_bin)
+
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 2, 1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2, 2, 2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2, 2, 3)
+    show_mask_region("CTR Region", diff_mask)
+    plt.tight_layout()
+    plt.show()
+
+
+# === Metric 可视化 ===
+
+def visualize_mse_metric_region(gt_alpha, pred_alpha, trimap=None):
+    # trimap 可空，使用 gt_alpha 估计
+    mask_src = trimap if trimap is not None else gt_alpha
+    unknown = extract_unknown_mask(mask_src)
+    mse_map = (pred_alpha - gt_alpha) ** 2 * unknown
+
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 2, 1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2, 2, 2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2, 2, 3)
+    show_mask_region("Unknown Mask", unknown)
+    plt.subplot(2, 2, 4)
+    show_mask_region("MSE Map", mse_map)
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_sad_metric_region(gt_alpha, pred_alpha, trimap=None):
+    mask_src = trimap if trimap is not None else gt_alpha
+    unknown = extract_unknown_mask(mask_src, strategy='auto')
+    sad_map = torch.abs(pred_alpha - gt_alpha) * unknown
+
+    plt.figure(figsize=(10, 8))
+    plt.subplot(2, 2, 1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2, 2, 2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2, 2, 3)
+    show_mask_region("Unknown Mask", unknown)
+    plt.subplot(2, 2, 4)
+    show_mask_region("SAD Map", sad_map)
+    plt.tight_layout()
+    plt.show()
+
+def visualize_grad_metric_region(gt_alpha, pred_alpha, trimap=None, eps=1e-6):
+    mask_src = trimap if trimap is not None else gt_alpha
+    unknown = extract_unknown_mask(mask_src, strategy='auto')
+    def get_gradient_xy(x):
+        kx = torch.tensor([[1, 0, -1],[2,0,-2],[1,0,-1]],dtype=torch.float32).view(1,1,3,3).to(x.device)
+        ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]],dtype=torch.float32).view(1,1,3,3).to(x.device)
+        gx = F.conv2d(x,kx,padding=1)
+        gy = F.conv2d(x,ky,padding=1)
+        return gx, gy
+    pred_gx, pred_gy = get_gradient_xy(pred_alpha)
+    gt_gx, gt_gy     = get_gradient_xy(gt_alpha)
+    diff_map = (torch.abs(pred_gx - gt_gx) + torch.abs(pred_gy - gt_gy)) / 2.0
+    masked_grad_map = diff_map * unknown
+    plt.figure(figsize=(10,8))
+    plt.subplot(2,2,1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2,2,2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2,2,3)
+    show_mask_region("Unknown Mask", unknown)
+    plt.subplot(2,2,4)
+    show_mask_region("Grad Error Map", masked_grad_map)
+    plt.tight_layout()
+    plt.show()
+
+def visualize_conn_metric_region(gt_alpha, pred_alpha, trimap=None, threshold=0.5):
+    mask_src = trimap if trimap is not None else gt_alpha
+    unknown = extract_unknown_mask(mask_src)
+    # 最大连通前景
+    gt_bin = (gt_alpha[0,0].detach().cpu().numpy() > threshold).astype(np.uint8)
+    labeled, num = connected_components(gt_bin)
+    max_region, max_area = 0,0
+    for j in range(1,num+1):
+        area = (labeled==j).sum()
+        if area>max_area:
+            max_area, max_region = area, j
+    gt_main = (labeled==max_region).astype(np.float32)
+    gt_main_t = torch.from_numpy(gt_main).to(gt_alpha.device).unsqueeze(0).unsqueeze(0)
+    eval_mask = (gt_main_t * unknown).clamp(0,1)
+    bce_map = F.binary_cross_entropy(pred_alpha, gt_main_t, reduction='none') * eval_mask
+    plt.figure(figsize=(10,8))
+    plt.subplot(2,2,1)
+    show_mask_region("GT Alpha", gt_alpha)
+    plt.subplot(2,2,2)
+    show_mask_region("Pred Alpha", pred_alpha)
+    plt.subplot(2,2,3)
+    show_mask_region("Conn Eval Mask", eval_mask)
+    plt.subplot(2,2,4)
+    show_mask_region("Conn Error Map", bce_map)
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
-    # === 路径替换为你自己的 ===
-    gt_path = "../data/video_defocused_processed/train/alpha/0006/frames/0132.png"
-    coarse_path = "../data/video_defocused_processed/train/fgr/0006/mask/0132.png"
-    # gt_path = "../data/video_defocused_processed/train/alpha/0028/frames/0377.png"
-    # coarse_path = "../data/video_defocused_processed/train/fgr/0028/mask/0377.png"
+    # 示例路径，可不提供 trimap
+    gt_path = "../data/video_defocused_processed/train/alpha/0000/frames/0140.png"
+    pred_path = "../data/video_defocused_processed/train/fgr/0000/mask/0140.png"
+    trimap_path = None
+    coarse_path = None
 
     to_tensor = T.ToTensor()
-    gt_alpha = to_tensor(Image.open(gt_path).convert("L")).unsqueeze(0)  # (1, 1, H, W)
-    coarse_mask = to_tensor(Image.open(coarse_path).convert("L")).unsqueeze(0)
+    gt_alpha = to_tensor(Image.open(gt_path).convert("L")).unsqueeze(0)
+    pred_alpha = to_tensor(Image.open(pred_path).convert("L")).unsqueeze(0)
+    trimap = to_tensor(Image.open(trimap_path).convert("L")).unsqueeze(0) if trimap_path else None
+    coarse = to_tensor(Image.open(coarse_path).convert("L")).unsqueeze(0) if coarse_path else None
 
-    # visualize_grad_loss_region(gt_alpha, coarse_mask)
-    visualize_cf_loss_region(gt_alpha, coarse_mask)
-    # visualize_ctr_loss_region(gt_alpha, coarse_mask)
-    # visualize_conn_loss_region_simple(gt_alpha, coarse_mask)
-    # visualize_sad_loss_region(gt_alpha, coarse_mask)
+    # Loss 可视
+    visualize_cf_loss_region(gt_alpha, pred_alpha, trimap)
+    visualize_grad_loss_region(gt_alpha, pred_alpha, coarse)
+    visualize_conn_loss_region(gt_alpha, pred_alpha)
+    visualize_sad_loss_region(gt_alpha, pred_alpha)
+    visualize_ctr_loss_region(gt_alpha, pred_alpha)
 
+    # Metrics 可视
+    visualize_mse_metric_region(gt_alpha, pred_alpha, trimap)
+    visualize_sad_metric_region(gt_alpha, pred_alpha, trimap)
+    visualize_grad_metric_region(gt_alpha, pred_alpha, trimap)
+    visualize_conn_metric_region(gt_alpha, pred_alpha, trimap)

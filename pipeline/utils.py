@@ -4,39 +4,51 @@ import torch.nn.functional as F
 
 def extract_unknown_mask(trimap, strategy='auto', threshold=20):
     """
-    提取 unknown 区域的掩码（适用于不同格式的 trimap）
+    提取 unknown 区域的掩码（适用于不同格式的 trimap 或 alpha matte）
+
     :param trimap: [B, 1, H, W] or [B, H, W] tensor, dtype = uint8 or float
-    :param strategy: 'auto' 自动识别, 或 'fixed' 使用值128, 或 'range' 使用阈值范围
-    :param threshold: 仅当 strategy='range' 时，控制 unknown 区域的灰度范围宽度
+                   - 可传入真实 trimap（三值），也可传入 alpha matte（自动估计 unknown）
+    :param strategy: 'auto' | 'fixed' | 'range'
+    :param threshold: 用于 'range' 模式，表示 [128 - t, 128 + t] 或 [0.5 - t, 0.5 + t]
     :return: unknown 区域掩码（float 类型，[B, 1, H, W]）
     """
     if trimap.ndim == 3:
         trimap = trimap.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
 
+    is_float = trimap.dtype in [torch.float32, torch.float64]
+
     if strategy == 'fixed':
         unknown_mask = (trimap == 128).float()
 
     elif strategy == 'range':
-        # 例如范围 [128-threshold, 128+threshold]
-        lower = 128 - threshold
-        upper = 128 + threshold
+        if is_float:
+            lower = 0.5 - threshold
+            upper = 0.5 + threshold
+        else:
+            lower = 128 - threshold
+            upper = 128 + threshold
         unknown_mask = ((trimap >= lower) & (trimap <= upper)).float()
 
     elif strategy == 'auto':
         unique_vals = torch.unique(trimap)
         if unique_vals.numel() == 3:
-            # 常见三值trimap [0, 128, 255] 或 [0, 1, 2]
+            # 常见三值trimap
             sorted_vals = unique_vals.sort()[0]
             unknown_val = sorted_vals[1]
             unknown_mask = (trimap == unknown_val).float()
         else:
-            # fallback to range-based detection
-            unknown_mask = ((trimap > 10) & (trimap < 245)).float()
+            # fallback: 估计自 alpha matte
+            if is_float:
+                unknown_mask = ((trimap > 0.1) & (trimap < 0.9)).float()
+            else:
+                unknown_mask = ((trimap > 25) & (trimap < 230)).float()
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
     return unknown_mask
 
+
+################################################ metrics ################################################
 
 def compute_mse_with_trimap(pred, gt, trimap):
     unknown_mask = extract_unknown_mask(trimap)  # 使用我们之前写的函数
@@ -114,50 +126,55 @@ def compute_conn_with_unknown_mask(pred, gt, trimap, threshold=0.5):
 
 def compute_grad_metric(pred_alpha, gt_alpha, trimap, eps=1e-6):
     """
-    Gradient Metric（评估指标）:
-    衡量预测 matte 与 GT matte 在梯度图上的差异。
-    仅在 trimap 的 unknown 区域上计算。
-
-    Args:
-        pred_alpha: [B, 1, H, W]，预测 alpha matte
-        gt_alpha: [B, 1, H, W]，GT alpha matte
-        trimap: [B, 1, H, W] or [B, H, W]，三值 trimap
-        eps: 防除零稳定项
+    Gradient Metric（benchmark 版评估指标）:
+    - 在 trimap 的 unknown 区域上计算
+    - 分别计算 x、y 方向梯度的平均绝对差
+      grad_error = (sum(|∇x_pred - ∇x_gt|) + sum(|∇y_pred - ∇y_gt|))
+                   / (2 * num_unknown_pixels)
     Returns:
         mean gradient error over batch（标量）
     """
-    def get_gradient(x):
+    def get_gradient_xy(x):
         kernel_x = torch.tensor([[1, 0, -1],
                                  [2, 0, -2],
                                  [1, 0, -1]], dtype=torch.float32).view(1, 1, 3, 3).to(x.device)
         kernel_y = torch.tensor([[1, 2, 1],
                                  [0, 0, 0],
                                  [-1, -2, -1]], dtype=torch.float32).view(1, 1, 3, 3).to(x.device)
-        grad_x = F.conv2d(x, kernel_x, padding=1)
-        grad_y = F.conv2d(x, kernel_y, padding=1)
-        return torch.sqrt(grad_x ** 2 + grad_y ** 2 + eps)
+        gx = F.conv2d(x, kernel_x, padding=1)
+        gy = F.conv2d(x, kernel_y, padding=1)
+        return gx, gy
 
-    # 梯度图
-    pred_grad = get_gradient(pred_alpha)
-    gt_grad = get_gradient(gt_alpha)
+    # 1. 计算预测和 GT 的 x、y 梯度
+    pred_gx, pred_gy = get_gradient_xy(pred_alpha)
+    gt_gx,   gt_gy   = get_gradient_xy(gt_alpha)
 
-    # 提取 unknown 区域掩码
-    unknown_mask = extract_unknown_mask(trimap, strategy='auto')  # [B, 1, H, W]
+    # 2. 提取 unknown 区域掩码
+    unknown_mask = extract_unknown_mask(trimap, strategy='auto')  # [B,1,H,W]
 
-    # 梯度图差异（仅在 unknown 区域）
-    diff = torch.abs(pred_grad - gt_grad) * unknown_mask
-    grad_error_per_image = diff.sum(dim=[1, 2, 3]) / (unknown_mask.sum(dim=[1, 2, 3]) + eps)
+    # 3. 计算各方向的绝对差，并限制在 unknown 区域
+    diff_x = torch.abs(pred_gx - gt_gx) * unknown_mask
+    diff_y = torch.abs(pred_gy - gt_gy) * unknown_mask
 
-    return grad_error_per_image.mean()
+    # 4. 对每张图分别求和并除以 (2 * unknown_area)
+    area = unknown_mask.sum(dim=[1,2,3]) + eps
+    per_img_error = (diff_x.sum(dim=[1,2,3]) + diff_y.sum(dim=[1,2,3])) / (2 * area)
+
+    # 5. 批量取平均
+    return per_img_error.mean()
 
 
 
-def compute_grad_loss_trimapped(pred_alpha, gt_alpha, trimap, coarse_mask=None, lower=0.05, upper=0.95):
+################################################ loss ################################################
+
+def compute_grad_loss_soft_only(pred_alpha, gt_alpha, coarse_mask=None, lower=0.05, upper=0.95):
     """
-    Blur-aware Gradient Loss（融合 BiMatting 思想）:
-    - 仅在 trimap unknown 区域 ∩ soft matte 区域上计算
-    - 使用 GT 的边缘梯度作为权重引导训练，增强对虚化模糊边界的学习能力
+    Blur-aware Gradient Loss（不使用 trimap）:
+    - 仅在 GT 的 soft matte 区域上监督
+    - 可选进一步与 coarse mask 的 soft 区域相交
+    - 使用 GT 的边缘梯度作为权重，引导关注虚化边缘
     """
+
     def get_gradient(x):
         kernel_x = torch.tensor([[1, 0, -1],
                                  [2, 0, -2],
@@ -171,35 +188,23 @@ def compute_grad_loss_trimapped(pred_alpha, gt_alpha, trimap, coarse_mask=None, 
 
     eps = 1e-6
 
-    # 梯度计算
+    # === 梯度计算 ===
     pred_grad_x, pred_grad_y = get_gradient(pred_alpha)
     gt_grad_x, gt_grad_y = get_gradient(gt_alpha)
 
-    # GT soft matte 区域
+    # === soft matte 区域（GT中alpha ∈ (0.05, 0.95)） ===
     soft_mask = ((gt_alpha > lower) & (gt_alpha < upper)).float()
 
-    # 可选 coarse 区域细化
+    # 可选 coarse mask 限制
     if coarse_mask is not None:
         soft_mask *= ((coarse_mask > lower) & (coarse_mask < upper)).float()
 
-    # 使用已有函数提取 trimap unknown 区域
-    unknown_mask = extract_unknown_mask(trimap, strategy='auto')
-
-    # 组合 mask
-    full_mask = soft_mask * unknown_mask
-
-    # 尺寸对齐（如有必要）
-    full_mask = F.interpolate(full_mask, size=gt_grad_x.shape[2:], mode='nearest')
-
-    # === ✅ Blur-aware 部分 ===
-    # 1. 获取 GT 的边缘强度图
+    # === blur-aware 部分 ===
     edge_strength = torch.sqrt(gt_grad_x ** 2 + gt_grad_y ** 2 + eps)
-
-    # 2. 归一化为 [0, 1] 之间
     edge_weight = edge_strength / (edge_strength.max() + eps)
 
-    # 3. 应用权重到 full_mask 区域
-    weighted_mask = full_mask * edge_weight
+    # 组合权重
+    weighted_mask = soft_mask * edge_weight
 
     # === 计算带权梯度差 ===
     diff_x = torch.abs(pred_grad_x - gt_grad_x) * weighted_mask
@@ -232,7 +237,8 @@ def compute_cf_loss(pred_alpha, gt_alpha, trimap=None, use_trimap=False,
     """
     Closed-form Loss:
     只在 GT 的 soft matte 区域（可选限定在 trimap unknown 区域）上监督 pred_alpha。
-    
+    default do not restrict to trimap.
+
     Args:
         pred_alpha: [B, 1, H, W]，模型预测的 alpha matte
         gt_alpha: [B, 1, H, W]，ground-truth matte
@@ -293,3 +299,21 @@ def compute_ctr_loss(anchor, positive, negative, gt_alpha, pred_alpha=None, coar
 
     return loss.sum() / (diff_mask.sum() + 1e-6)
 
+
+def compute_sad_loss(pred_alpha, gt_alpha, lower=0.1, upper=0.9):
+    """
+    计算不依赖 trimap 的 SAD Loss
+    - 使用 `gt_alpha` 的 soft 区域进行监督
+    - 计算 `abs(pred_alpha - gt_alpha)` 仅在 soft 区域内进行
+    """
+    # 提取 soft 区域 (alpha ∈ (0.1, 0.9))
+    soft_mask = ((gt_alpha > lower) & (gt_alpha < upper)).float()
+
+    # 计算绝对误差
+    abs_diff = torch.abs(pred_alpha - gt_alpha)
+
+    # 计算 loss map（仅在 soft 区域内）
+    loss_map = abs_diff * soft_mask
+
+    # 返回最终的 loss（平均）
+    return loss_map.sum() / (soft_mask.sum() + 1e-6)
