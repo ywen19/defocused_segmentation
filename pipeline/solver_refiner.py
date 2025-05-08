@@ -12,7 +12,8 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from dataload.build_dataloaders import build_dataloaders
-from model.refiner_sanity import RefinerWithWaveletEncoder  # ✅ 替换为你的新模型
+from model.refiner_sanity_dualbranch import RefinerWithDualBranch  # ✅ 你的 Dual-Branch 模型
+
 
 # ---------- 边缘 loss ----------
 def compute_edge_loss(pred, gt):
@@ -22,20 +23,25 @@ def compute_edge_loss(pred, gt):
     gt_dy = gt[:, :, 1:, :] - gt[:, :, :-1, :]
     return F.l1_loss(pred_dx, gt_dx) + F.l1_loss(pred_dy, gt_dy)
 
+
 # ---------- 可视化 ----------
-def save_visualization(rgb, m_init, m_gt, m_pred, static_error_map, pred_error_map, save_path):
+def save_visualization(rgb, m_init, m_gt, m_pred, static_error_map, pred_error_map, corr_fp, corr_fn, save_path):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
     def to_numpy(x): return x.detach().cpu().squeeze().numpy()
 
-    fig, axs = plt.subplots(1, 6, figsize=(24, 4))
+    fig, axs = plt.subplots(1, 8, figsize=(32, 4))
     axs[0].imshow(to_numpy(rgb).transpose(1, 2, 0)); axs[0].set_title("RGB")
     axs[1].imshow(to_numpy(m_init), cmap='gray'); axs[1].set_title("Init Mask")
     axs[2].imshow(to_numpy(m_gt), cmap='gray'); axs[2].set_title("GT Matte")
     axs[3].imshow(to_numpy(m_pred), cmap='gray'); axs[3].set_title("Pred Matte")
     axs[4].imshow(to_numpy(static_error_map), cmap='hot'); axs[4].set_title("Static Error Map")
     axs[5].imshow(to_numpy(pred_error_map), cmap='hot'); axs[5].set_title("Pred Error Map")
+    axs[6].imshow(to_numpy(corr_fp), cmap='hot'); axs[6].set_title("FP Correction")
+    axs[7].imshow(to_numpy(corr_fn), cmap='hot'); axs[7].set_title("FN Correction")
     for ax in axs: ax.axis('off')
     plt.tight_layout(); fig.savefig(save_path); plt.close(fig)
+
 
 # ---------- 训练主函数 ----------
 def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
@@ -60,8 +66,13 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
         edge_map = F.avg_pool2d(edge_map, 3, stride=1, padding=1)
         static_error_map = (static_error + 0.5 * edge_map).clamp(0, 1)
 
+        # FP/FN binary masks
+        fp_mask = ((init_mask > 0.5) & (gt < 0.5)).float()
+        fn_mask = ((init_mask < 0.5) & (gt > 0.5)).float()
+
         with autocast():
-            m_pred = model(rgb, init_mask, static_error_map)
+            # Forward pass with gated correction
+            m_pred, corr_fp, corr_fn = model(rgb, init_mask, static_error_map, fp_mask, fn_mask)
 
             # Main loss
             fg_mask = (gt > 0.05).float()
@@ -70,7 +81,7 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
             loss_main = F.l1_loss(m_pred, gt, reduction='none')
             loss_main = (loss_main * weight).mean()
 
-            # Dynamic pred error
+            # Structure-aware loss
             pred_error = (m_pred.detach() - gt).abs()
             combined_mask = (static_error > 0.05).float() * pred_error
             loss_structure = F.l1_loss(m_pred * combined_mask, gt * combined_mask)
@@ -78,13 +89,27 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
             # Edge loss
             loss_edge = compute_edge_loss(m_pred, gt)
 
-            # Optional: smoothness loss（鼓励区域平滑）
+            # Smoothness loss
             laplace_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device=device).view(1,1,3,3)
             laplace = F.conv2d(m_pred, laplace_kernel, padding=1)
             loss_smooth = laplace.abs().mean()
 
+            # FP/FN correction loss
+            target_fp = (init_mask - gt).clamp(min=0)
+            target_fn = (gt - init_mask).clamp(min=0)
+            loss_fp = F.l1_loss(corr_fp, target_fp)
+            loss_fn = F.l1_loss(corr_fn, target_fn)
+
+            # Total loss
             structure_weight = 10.0 if epoch <= 3 else 5.0
-            loss = (loss_main + structure_weight * loss_structure + 0.3 * loss_edge + 0.1 * loss_smooth) / accum_steps
+            loss = (
+                loss_main +
+                structure_weight * loss_structure +
+                0.3 * loss_edge +
+                0.1 * loss_smooth +
+                0.5 * loss_fp +
+                0.5 * loss_fn
+            ) / accum_steps
 
         scaler.scale(loss).backward()
 
@@ -100,7 +125,10 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
 
             save_path = os.path.join(vis_dir, f"epoch{epoch}_step{i+1}.png")
             save_visualization(rgb[0], init_mask[0], gt[0], m_pred[0],
-                               static_error_map[0], pred_error[0], save_path)
+                               static_error_map[0], pred_error[0],
+                               corr_fp[0], corr_fn[0],
+                               save_path)
+
 
 # ---------- 启动入口 ----------
 def main():
@@ -122,7 +150,7 @@ def main():
 
     base_seed = 42
 
-    model = RefinerWithWaveletEncoder(base_channels=64).to(device)
+    model = RefinerWithDualBranch(base_channels=64).to(device)
     scaler = GradScaler()
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
 
@@ -130,12 +158,12 @@ def main():
         print(f"\n--- Epoch {epoch}/{config['num_epochs']} ---")
 
         train_loader, val_loader = build_dataloaders(
-            csv_path='../data/pair_for_refiner.csv',
-            resize_to=(736, 1280),
-            batch_size=4,
-            num_workers=4,
+            csv_path=config["csv_path"],
+            resize_to=config["resize_to"],
+            batch_size=config["batch_size"],
+            num_workers=config["num_workers"],
             seed=base_seed,
-            epoch_seed=base_seed + epoch,  # 每个 epoch 都不同但可复现
+            epoch_seed=base_seed + epoch,
             shuffle=True,
         )
 
@@ -151,6 +179,7 @@ def main():
         del val_loader
         gc.collect()
         torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     main()
