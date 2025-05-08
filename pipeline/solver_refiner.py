@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from dataload.build_dataloaders import build_dataloaders
-from model.refiner_sanity_dualbranch import RefinerWithDualBranch  # ✅ 你的 Dual-Branch 模型
+from model.refiner_sanity_dualbranch import RefinerWithDualBranch
 
 
 # ---------- 边缘 loss ----------
@@ -66,12 +66,20 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
         edge_map = F.avg_pool2d(edge_map, 3, stride=1, padding=1)
         static_error_map = (static_error + 0.5 * edge_map).clamp(0, 1)
 
-        # FP/FN binary masks
-        fp_mask = ((init_mask > 0.5) & (gt < 0.5)).float()
-        fn_mask = ((init_mask < 0.5) & (gt > 0.5)).float()
-
         with autocast():
-            # Forward pass with gated correction
+            # Forward pass without masks first (for m_pred-dependent masking)
+            m_pred, corr_fp, corr_fn = model(rgb, init_mask, static_error_map)
+
+            # Hybrid FP/FN masks
+            if epoch <= 3:
+                fp_mask = ((init_mask > 0.5) & (gt < 0.5)).float()
+                fn_mask = ((init_mask < 0.5) & (gt > 0.5)).float()
+            else:
+                with torch.no_grad():
+                    fp_mask = ((m_pred.detach() > 0.5) & (gt < 0.5)).float()
+                    fn_mask = ((m_pred.detach() < 0.5) & (gt > 0.5)).float()
+
+            # Forward again with proper mask-gated correction
             m_pred, corr_fp, corr_fn = model(rgb, init_mask, static_error_map, fp_mask, fn_mask)
 
             # Main loss
@@ -133,12 +141,12 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
 # ---------- 启动入口 ----------
 def main():
     config = {
-        "num_epochs": 3,
+        "num_epochs": 5,
         "batch_size": 2,
         "print_interval": 20,
         "checkpoint_dir": "checkpoints",
         "csv_path": "../data/pair_for_refiner.csv",
-        "resize_to": (736, 1280),
+        "resize_to": (1088, 1920),
         "num_workers": 6,
         "lr": 5e-4,
         "weight_decay": 0,
@@ -150,7 +158,7 @@ def main():
 
     base_seed = 42
 
-    model = RefinerWithDualBranch(base_channels=64).to(device)
+    model = RefinerWithDualBranch(base_channels=64, num_downsample=3).to(device)
     scaler = GradScaler()
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
 
@@ -165,6 +173,7 @@ def main():
             seed=base_seed,
             epoch_seed=base_seed + epoch,
             shuffle=True,
+            sample_fraction=50,
         )
 
         train_with_error_map(model, train_loader, optimizer, scaler, device, epoch,
