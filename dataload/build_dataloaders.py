@@ -8,6 +8,7 @@ def build_dataloaders(
     num_workers=4,
     split_ratio=0.8,
     seed=42,
+    epoch_seed=None,
     shuffle=True,
     sample_fraction=1.0
 ):
@@ -20,9 +21,10 @@ def build_dataloaders(
         batch_size (int): Batch size for DataLoader.
         num_workers (int): Number of workers for DataLoader.
         split_ratio (float): Ratio of training set split (default 0.8 = 80% train, 20% val).
-        seed (int): Random seed for reproducibility.
+        seed (int): Random seed for data splitting.
+        epoch_seed (int): Epoch-level seed for deterministic shuffling.
         shuffle (bool): Whether to shuffle training samples.
-        sample_fraction (float): Fraction of data to keep for testing learning behavior.
+        sample_fraction (float): Fraction of data to keep for quick experiments.
 
     Returns:
         train_loader, val_loader: PyTorch DataLoaders
@@ -35,9 +37,9 @@ def build_dataloaders(
     train_rows = train_rows[:max(1, int(len(train_rows) * sample_fraction))]
     val_rows = val_rows[:max(1, int(len(val_rows) * sample_fraction))]
 
-    # Step 3: Build Iterable DataPipes
-    train_pipe = build_iterable_datapipe(train_rows, resize_to=resize_to, shuffle=shuffle)
-    val_pipe = build_iterable_datapipe(val_rows, resize_to=resize_to, shuffle=False)
+    # Step 3: Build Iterable DataPipes with epoch seed
+    train_pipe = build_iterable_datapipe(train_rows, resize_to=resize_to, shuffle=shuffle, seed=epoch_seed or seed)
+    val_pipe = build_iterable_datapipe(val_rows, resize_to=resize_to, shuffle=False, seed=seed)
 
     # Step 4: Wrap in DataLoader
     train_loader = DataLoader(train_pipe, batch_size=batch_size, num_workers=num_workers, pin_memory=True)

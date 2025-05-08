@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -11,7 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from dataload.build_dataloaders import build_dataloaders
-from model.refiner_sanity import RefinerWithErrorMap
+from model.refiner_sanity import RefinerWithWaveletEncoder  # ✅ 替换为你的新模型
 
 # ---------- 边缘 loss ----------
 def compute_edge_loss(pred, gt):
@@ -70,15 +71,20 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
             loss_main = (loss_main * weight).mean()
 
             # Dynamic pred error
-            pred_error = (m_pred.detach() - gt).abs()  # no grad
-            combined_mask = (static_error > 0.05).float() * pred_error  # highlight not-yet-fixed areas
+            pred_error = (m_pred.detach() - gt).abs()
+            combined_mask = (static_error > 0.05).float() * pred_error
             loss_structure = F.l1_loss(m_pred * combined_mask, gt * combined_mask)
 
             # Edge loss
             loss_edge = compute_edge_loss(m_pred, gt)
 
+            # Optional: smoothness loss（鼓励区域平滑）
+            laplace_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device=device).view(1,1,3,3)
+            laplace = F.conv2d(m_pred, laplace_kernel, padding=1)
+            loss_smooth = laplace.abs().mean()
+
             structure_weight = 10.0 if epoch <= 3 else 5.0
-            loss = (loss_main + structure_weight * loss_structure + 0.3 * loss_edge) / accum_steps
+            loss = (loss_main + structure_weight * loss_structure + 0.3 * loss_edge + 0.1 * loss_smooth) / accum_steps
 
         scaler.scale(loss).backward()
 
@@ -100,7 +106,7 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
 def main():
     config = {
         "num_epochs": 3,
-        "batch_size": 1,
+        "batch_size": 2,
         "print_interval": 20,
         "checkpoint_dir": "checkpoints",
         "csv_path": "../data/pair_for_refiner.csv",
@@ -114,27 +120,37 @@ def main():
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader, _ = build_dataloaders(
-        csv_path=config["csv_path"],
-        resize_to=config["resize_to"],
-        batch_size=config["batch_size"],
-        num_workers=config["num_workers"],
-        sample_fraction=1.0,
-    )
+    base_seed = 42
 
-    model = RefinerWithErrorMap(base_channels=64).to(device)
+    model = RefinerWithWaveletEncoder(base_channels=64).to(device)
     scaler = GradScaler()
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
 
     for epoch in range(1, config["num_epochs"] + 1):
         print(f"\n--- Epoch {epoch}/{config['num_epochs']} ---")
+
+        train_loader, val_loader = build_dataloaders(
+            csv_path='../data/pair_for_refiner.csv',
+            resize_to=(736, 1280),
+            batch_size=4,
+            num_workers=4,
+            seed=base_seed,
+            epoch_seed=base_seed + epoch,  # 每个 epoch 都不同但可复现
+            shuffle=True,
+        )
+
         train_with_error_map(model, train_loader, optimizer, scaler, device, epoch,
                              print_interval=config["print_interval"],
                              accum_steps=config["accum_steps"])
 
-        ckpt_path = os.path.join(config["checkpoint_dir"], f"refiner_error_map_epoch{epoch}.pth")
+        ckpt_path = os.path.join(config["checkpoint_dir"], f"refiner_wavelet_epoch{epoch}.pth")
         torch.save(model.state_dict(), ckpt_path)
         print(f"Checkpoint saved to {ckpt_path}")
+
+        del train_loader
+        del val_loader
+        gc.collect()
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()

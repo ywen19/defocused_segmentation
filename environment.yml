@@ -43,3 +43,5 @@ dependencies:
       - "imageio>=2.33,!=2.35.0"
       - ultralytics
       - kornia>=0.7.1  # ✅ Add Kornia here
+      - git+https://github.com/fbcotter/pytorch_wavelets.git
+      - PyWavelets>=1.4.1
