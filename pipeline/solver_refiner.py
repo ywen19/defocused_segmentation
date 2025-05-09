@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from dataload.build_dataloaders import build_dataloaders
-from model.refiner_sanity_dualbranch import RefinerWithDualBranch
+from model.refiner_sanity_dualbranch_V2 import RefinerWithDualBranch
 
 
 # ---------- 边缘 loss ----------
@@ -45,7 +45,7 @@ def save_visualization(rgb, m_init, m_gt, m_pred, static_error_map, pred_error_m
 
 # ---------- 训练主函数 ----------
 def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
-                         print_interval=20, accum_steps=4, vis_dir="vis"):
+                         print_interval=20, accum_steps=4, vis_dir="vis3"):
     model.train()
     optimizer.zero_grad()
 
@@ -146,7 +146,8 @@ def main():
         "print_interval": 20,
         "checkpoint_dir": "checkpoints",
         "csv_path": "../data/pair_for_refiner.csv",
-        "resize_to": (1088, 1920),
+        # "resize_to": (1088, 1920),
+        "resize_to": (376, 1280),
         "num_workers": 6,
         "lr": 5e-4,
         "weight_decay": 0,
@@ -158,7 +159,7 @@ def main():
 
     base_seed = 42
 
-    model = RefinerWithDualBranch(base_channels=64, num_downsample=3).to(device)
+    model = RefinerWithDualBranch(base_channels=64, num_downsample=2).to(device)
     scaler = GradScaler()
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
 
