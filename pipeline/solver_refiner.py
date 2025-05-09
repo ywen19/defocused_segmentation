@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 import matplotlib.pyplot as plt
+from pytorch_wavelets import DWTForward
 
 # 项目路径
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -13,7 +14,6 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from dataload.build_dataloaders import build_dataloaders
 from model.refiner_sanity_dualbranch_V2 import RefinerWithDualBranch
-
 
 # ---------- 边缘 loss ----------
 def compute_edge_loss(pred, gt):
@@ -23,14 +23,13 @@ def compute_edge_loss(pred, gt):
     gt_dy = gt[:, :, 1:, :] - gt[:, :, :-1, :]
     return F.l1_loss(pred_dx, gt_dx) + F.l1_loss(pred_dy, gt_dy)
 
-
 # ---------- 可视化 ----------
-def save_visualization(rgb, m_init, m_gt, m_pred, static_error_map, pred_error_map, corr_fp, corr_fn, save_path):
+def save_visualization(rgb, m_init, m_gt, m_pred, static_error_map, pred_error_map, corr_fp, corr_fn, save_path, blur_att=None):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     def to_numpy(x): return x.detach().cpu().squeeze().numpy()
 
-    fig, axs = plt.subplots(1, 8, figsize=(32, 4))
+    fig, axs = plt.subplots(1, 9 if blur_att is not None else 8, figsize=(36, 4))
     axs[0].imshow(to_numpy(rgb).transpose(1, 2, 0)); axs[0].set_title("RGB")
     axs[1].imshow(to_numpy(m_init), cmap='gray'); axs[1].set_title("Init Mask")
     axs[2].imshow(to_numpy(m_gt), cmap='gray'); axs[2].set_title("GT Matte")
@@ -39,13 +38,14 @@ def save_visualization(rgb, m_init, m_gt, m_pred, static_error_map, pred_error_m
     axs[5].imshow(to_numpy(pred_error_map), cmap='hot'); axs[5].set_title("Pred Error Map")
     axs[6].imshow(to_numpy(corr_fp), cmap='hot'); axs[6].set_title("FP Correction")
     axs[7].imshow(to_numpy(corr_fn), cmap='hot'); axs[7].set_title("FN Correction")
+    if blur_att is not None:
+        axs[8].imshow(to_numpy(blur_att), cmap='hot'); axs[8].set_title("Blur Attention")
     for ax in axs: ax.axis('off')
     plt.tight_layout(); fig.savefig(save_path); plt.close(fig)
 
-
 # ---------- 训练主函数 ----------
 def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
-                         print_interval=20, accum_steps=4, vis_dir="vis3"):
+                         print_interval=20, accum_steps=4, vis_dir="vis3", wavelet_dwt=None):
     model.train()
     optimizer.zero_grad()
 
@@ -55,9 +55,7 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
     for i, batch in enumerate(loader):
         rgb, init_mask, gt = [x.to(device) for x in batch]
 
-        # Static error map from GT and init
         static_error = (gt - init_mask).abs()
-
         dx = gt[:, :, :, 1:] - gt[:, :, :, :-1]
         dx = pad_w(dx)
         dy = gt[:, :, 1:, :] - gt[:, :, :-1, :]
@@ -67,10 +65,8 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
         static_error_map = (static_error + 0.5 * edge_map).clamp(0, 1)
 
         with autocast():
-            # Forward pass without masks first (for m_pred-dependent masking)
             m_pred, corr_fp, corr_fn = model(rgb, init_mask, static_error_map)
 
-            # Hybrid FP/FN masks
             if epoch <= 3:
                 fp_mask = ((init_mask > 0.5) & (gt < 0.5)).float()
                 fn_mask = ((init_mask < 0.5) & (gt > 0.5)).float()
@@ -79,36 +75,35 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
                     fp_mask = ((m_pred.detach() > 0.5) & (gt < 0.5)).float()
                     fn_mask = ((m_pred.detach() < 0.5) & (gt > 0.5)).float()
 
-            # Forward again with proper mask-gated correction
             m_pred, corr_fp, corr_fn = model(rgb, init_mask, static_error_map, fp_mask, fn_mask)
 
-            # Main loss
             fg_mask = (gt > 0.05).float()
             bg_mask = 1.0 - fg_mask
             weight = 1.0 * fg_mask + 0.3 * bg_mask
             loss_main = F.l1_loss(m_pred, gt, reduction='none')
             loss_main = (loss_main * weight).mean()
 
-            # Structure-aware loss
             pred_error = (m_pred.detach() - gt).abs()
             combined_mask = (static_error > 0.05).float() * pred_error
             loss_structure = F.l1_loss(m_pred * combined_mask, gt * combined_mask)
 
-            # Edge loss
             loss_edge = compute_edge_loss(m_pred, gt)
 
-            # Smoothness loss
             laplace_kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32, device=device).view(1,1,3,3)
             laplace = F.conv2d(m_pred, laplace_kernel, padding=1)
             loss_smooth = laplace.abs().mean()
 
-            # FP/FN correction loss
             target_fp = (init_mask - gt).clamp(min=0)
             target_fn = (gt - init_mask).clamp(min=0)
             loss_fp = F.l1_loss(corr_fp, target_fp)
             loss_fn = F.l1_loss(corr_fn, target_fn)
 
-            # Total loss
+            # Frequency consistency loss
+            with torch.no_grad():
+                Yl_gt, Yh_gt = wavelet_dwt(gt)
+            Yl_pred, Yh_pred = wavelet_dwt(m_pred)
+            loss_freq = F.l1_loss(Yh_pred[0], Yh_gt[0])
+
             structure_weight = 10.0 if epoch <= 3 else 5.0
             loss = (
                 loss_main +
@@ -116,7 +111,8 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
                 0.3 * loss_edge +
                 0.1 * loss_smooth +
                 0.5 * loss_fp +
-                0.5 * loss_fn
+                0.5 * loss_fn +
+                0.5 * loss_freq
             ) / accum_steps
 
         scaler.scale(loss).backward()
@@ -131,12 +127,12 @@ def train_with_error_map(model, loader, optimizer, scaler, device, epoch,
                   f"Loss: {loss.item():.4f} | Pred mean: {m_pred.mean().item():.4f}, "
                   f"min/max: {m_pred.min().item():.4f}/{m_pred.max().item():.4f}")
 
+            blur_att = model.encoder.bada_att_map[0] if hasattr(model.encoder, "bada_att_map") else None
             save_path = os.path.join(vis_dir, f"epoch{epoch}_step{i+1}.png")
             save_visualization(rgb[0], init_mask[0], gt[0], m_pred[0],
                                static_error_map[0], pred_error[0],
                                corr_fp[0], corr_fn[0],
-                               save_path)
-
+                               save_path, blur_att)
 
 # ---------- 启动入口 ----------
 def main():
@@ -146,7 +142,6 @@ def main():
         "print_interval": 20,
         "checkpoint_dir": "checkpoints",
         "csv_path": "../data/pair_for_refiner.csv",
-        # "resize_to": (1088, 1920),
         "resize_to": (376, 1280),
         "num_workers": 6,
         "lr": 5e-4,
@@ -157,11 +152,11 @@ def main():
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    base_seed = 42
-
     model = RefinerWithDualBranch(base_channels=64, num_downsample=2).to(device)
     scaler = GradScaler()
     optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+
+    wavelet_dwt = DWTForward(J=1, mode='zero', wave='haar').to(device)
 
     for epoch in range(1, config["num_epochs"] + 1):
         print(f"\n--- Epoch {epoch}/{config['num_epochs']} ---")
@@ -171,25 +166,24 @@ def main():
             resize_to=config["resize_to"],
             batch_size=config["batch_size"],
             num_workers=config["num_workers"],
-            seed=base_seed,
-            epoch_seed=base_seed + epoch,
+            seed=42,
+            epoch_seed=42 + epoch,
             shuffle=True,
             sample_fraction=50,
         )
 
         train_with_error_map(model, train_loader, optimizer, scaler, device, epoch,
                              print_interval=config["print_interval"],
-                             accum_steps=config["accum_steps"])
+                             accum_steps=config["accum_steps"],
+                             wavelet_dwt=wavelet_dwt)
 
         ckpt_path = os.path.join(config["checkpoint_dir"], f"refiner_wavelet_epoch{epoch}.pth")
         torch.save(model.state_dict(), ckpt_path)
         print(f"Checkpoint saved to {ckpt_path}")
 
-        del train_loader
-        del val_loader
+        del train_loader, val_loader
         gc.collect()
         torch.cuda.empty_cache()
-
 
 if __name__ == "__main__":
     main()
