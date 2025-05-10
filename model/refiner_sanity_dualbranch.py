@@ -11,7 +11,7 @@ class WaveletEncoderV2(nn.Module):
         self.num_downsample = num_downsample
         self.dropout_prob = dropout_prob
 
-        # LL path with 1 BatchNorm after last conv
+        # LL path
         self.conv_ll = nn.Sequential(
             nn.Conv2d(3, base_channels, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -20,7 +20,7 @@ class WaveletEncoderV2(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # HF path with 1 BatchNorm after last conv
+        # HF path
         self.conv_hf = nn.Sequential(
             nn.Conv2d(9, base_channels // 2, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -29,7 +29,8 @@ class WaveletEncoderV2(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        in_channels = base_channels + base_channels // 2 + 1  # LL + HF + init_mask
+        # Fusion layers
+        in_channels = base_channels + base_channels // 2  # LL + HF only
         layers = []
         for _ in range(num_downsample):
             out_channels = base_channels * 2
@@ -55,8 +56,13 @@ class WaveletEncoderV2(nn.Module):
 
         feat_ll = self.conv_ll(Yl)
         feat_hf = self.conv_hf(hf)
+
+        # Downsample mask and use it as modulation
         mask_ds = F.interpolate(init_mask, size=feat_ll.shape[2:], mode='bilinear', align_corners=False)
-        x = torch.cat([feat_ll, feat_hf, mask_ds], dim=1)
+        feat_ll_mod = feat_ll * (1 + 0.5 * mask_ds)  # mask guidance (soft enhancement)
+
+        # No direct concat with mask
+        x = torch.cat([feat_ll_mod, feat_hf], dim=1)
         fused = self.fuse(x)
         return fused
 
@@ -84,7 +90,7 @@ class DecoderBlock(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout2d(dropout_prob),
             nn.Conv2d(self.final_channels, 1, 1),
-            nn.Sigmoid()
+            # nn.Sigmoid()  # REMOVED to allow regression-style output
         )
 
     def forward(self, x, error_map_fullres):
@@ -107,7 +113,7 @@ class RefinerWithDualBranch(nn.Module):
             nn.Conv2d(base_channels * 4, base_channels * 2, 3, padding=1),
             nn.BatchNorm2d(base_channels * 2),
             nn.ReLU(inplace=True)
-            # Dropout removed here to reduce GPU cost
+            # No dropout to save GPU memory
         )
 
         in_channels = base_channels * 2
