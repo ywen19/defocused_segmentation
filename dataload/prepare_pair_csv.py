@@ -93,7 +93,7 @@ if __name__ == '__main__':
                         help="Root folder containing 'fgr' and 'alpha'")
     parser.add_argument('--output_csv', type=str, default='../data/pair_for_refiner.csv',
                         help="Path to output CSV file")
-    parser.add_argument('--percent', type=float, default=5.0,
+    parser.add_argument('--percent', type=float, default=30,
                         help="Percentage of data to sample from each sequence")
 
     args = parser.parse_args()

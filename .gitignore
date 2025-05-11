@@ -166,6 +166,7 @@ cython_debug/
 *.pt
 *.mp4
 *.pth
+*.png
 # dataset for assignment
 data/
 MatAnyone/
@@ -174,3 +175,4 @@ segment-anything/
 .ipynb_checkpoints/
 *.pth
 *.jsonl
+vis*/
