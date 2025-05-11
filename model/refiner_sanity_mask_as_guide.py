@@ -56,7 +56,7 @@ def custom_iwt(ll, hf):
         )
     return recon
 
-# === Encoder Unchanged ===
+# === Encoder ===
 class WaveletEncoderV2(nn.Module):
     def __init__(self, base_channels=64, dropout_prob=0.3):
         super().__init__()
@@ -76,7 +76,7 @@ class WaveletEncoderV2(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.conv_hf = nn.Sequential(
-            nn.Conv2d(9, base_channels//2, 3, padding=1),
+            nn.Conv2d(3*3, base_channels//2, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(base_channels//2, base_channels//2, 3, padding=1),
             nn.BatchNorm2d(base_channels//2),
@@ -91,29 +91,26 @@ class WaveletEncoderV2(nn.Module):
         )
 
     def compute_required_downsample_steps(self, h_input, h_target):
-        assert h_input % h_target == 0
         ratio = h_input // h_target
-        steps = int(torch.log2(torch.tensor(ratio)).item())
-        return steps
+        return int(torch.log2(torch.tensor(ratio)).item())
 
     def forward(self, rgb, init_mask, error_map):
+        # wavelet decomposition
         ll, hf, info = custom_dwt(rgb)
         feat_ll = self.conv_ll(ll)
         feat_hf = self.conv_hf(hf)
-        H_in   = init_mask.shape[2]
-        H_feat = feat_ll.shape[2]
-        steps  = self.compute_required_downsample_steps(H_in, H_feat)
-
+        # downsample mask & error to match
+        H_in, H_feat = init_mask.shape[2], feat_ll.shape[2]
+        steps = self.compute_required_downsample_steps(H_in, H_feat)
         mask_ds, error_ds = init_mask, error_map
         for _ in range(steps):
             mask_ds  = self.mask_down_once(mask_ds)
             error_ds = self.error_down_once(error_ds)
-
         x = torch.cat([feat_ll, feat_hf, mask_ds + error_ds], dim=1)
         fused = self.fuse(x)
         return fused, ll, hf, info
 
-# === Decoder Unchanged ===
+# === Decoder ===
 class DecoderBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -121,13 +118,12 @@ class DecoderBlock(nn.Module):
             nn.Conv2d(in_channels, 3, 3, padding=1),
             nn.Tanh()
         )
-
     def forward(self, fused, ll, hf, info):
         refined_ll = self.recover_conv(fused)
         return custom_iwt(refined_ll, hf)
 
-# === RefinerWithDualBranch (Fixed) ===
-class RefinerWithDualBranch(nn.Module):
+# === Refiner with Residual Fusion & LL‐Gating ===
+class RefinerWithResidualGating(nn.Module):
     def __init__(self, base_channels=64, dropout_prob=0.3):
         super().__init__()
         self.encoder      = WaveletEncoderV2(base_channels, dropout_prob)
@@ -139,29 +135,59 @@ class RefinerWithDualBranch(nn.Module):
         )
         self.base_decoder = DecoderBlock(base_channels*2)
 
-        # **to_mask** now takes 3→1, matching decoded RGB channels
-        self.to_mask     = nn.Conv2d(3, 1, 1)
-        # Gate head from fused features
-        self.gate_conv   = nn.Conv2d(base_channels*2, 1, 1)
+        # matte heads
+        self.to_mask          = nn.Conv2d(3, 1, 1)
+        self.to_mask_unguided = nn.Conv2d(3, 1, 1)
 
-    def forward(self, rgb, init_mask, error_map, *args, **kwargs):
-        # 1) Encode & fuse
-        fused_feat, ll, hf, info = self.encoder(rgb, init_mask, error_map)
+        # gate head: take fused + (optional) error_map
+        c = base_channels*2
+        self.gate_head = nn.Sequential(
+            nn.Conv2d(c + 1, base_channels, 3, padding=1),  # +1 if concat error_map_ds
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, 1, 1),
+        )
+
+    def forward(self, rgb, init_mask, error_map):
+        # 1) encode guided
+        fused_feat, ll_guided, hf, info = self.encoder(rgb, init_mask, error_map)
+        # 2) encode unguided low-freq only
+        with torch.no_grad():
+            _, ll_unguided, _, _ = self.encoder(rgb, torch.zeros_like(init_mask), error_map)
+
+        # 3) fusion conv + skip
         skip  = self.skip_conv(fused_feat)
         fused = self.fusion_conv(torch.cat([fused_feat, skip], dim=1))
 
-        # 2) Decode to 3‐ch intermediate (same as before)
-        decoded = self.base_decoder(fused, ll, hf, info)  # [B,3,H,W]
-
-        # 3) Guided prediction
-        matte_guided = torch.sigmoid(self.to_mask(decoded))  # [B,1,H,W]
-
-        # 4) Gate prediction
-        gate_logits = self.gate_conv(fused)                  # [B,1,H',W']
+        # 4) build gate input: fused + error_map_ds
+        error_map_ds = F.interpolate(
+            error_map, size=fused.shape[-2:], mode='bilinear', align_corners=False
+        )
+        gate_logits = self.gate_head(torch.cat([fused, error_map_ds], dim=1))
         gate = torch.sigmoid(gate_logits)
-        # upsample gate if needed
-        if gate.shape[-2:] != matte_guided.shape[-2:]:
-            gate = F.interpolate(gate, size=matte_guided.shape[-2:],
-                                 mode='bilinear', align_corners=False)
 
-        return matte_guided, gate
+        # 5) upsample gates
+        gate_pix = F.interpolate(
+            gate, size=init_mask.shape[-2:], mode='bilinear', align_corners=False
+        )
+        gate_ll = F.interpolate(
+            gate, size=ll_guided.shape[-2:], mode='bilinear', align_corners=False
+        )
+
+        # 6) decode intermediate (guided low-freq + hf)
+        decoded = self.base_decoder(fused, ll_guided, hf, info)
+        mg = torch.sigmoid(self.to_mask(decoded))
+        mu = torch.sigmoid(self.to_mask_unguided(decoded))
+
+        # 7) pixel-domain residual fusion
+        refined_pix = mg + gate_pix * (mu - mg)
+
+        # 8) LL-domain residual fusion
+        ll_refined = ll_guided + gate_ll * (ll_unguided - ll_guided)
+
+        # 9) final decode from ll_refined + hf
+        final_decoded = self.base_decoder(fused, ll_refined, hf, info)
+        refined = torch.sigmoid(self.to_mask(final_decoded))
+
+        return refined, mg, mu, gate
