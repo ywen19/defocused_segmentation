@@ -25,7 +25,7 @@ from kornia.losses import SSIMLoss
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 from dataload.build_dataloaders import build_dataloaders
-from model.refiner_sanity_mask_scattering import RefinerMixed, multi_dwt_mixed
+from model.refiner_sanity_mask_attention_blur import RefinerMixedHybrid, multi_dwt_mixed
 
 # 用于记录每个 step 的 gate 平均值
 gate_history = []
@@ -209,7 +209,7 @@ if __name__=='__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if device.type=='cuda': torch.cuda.manual_seed_all(cfg['seed'])
 
-    model = RefinerMixed(base_channels=128, dropout_prob=0.3, wavelet_list=['db2', 'db1']).to(device)
+    model = RefinerMixedHybrid(base_channels=64, dropout_prob=0.3, wavelet_list=['db1']).to(device)
     scaler = GradScaler()
     opt = optim.Adam(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[7,11], gamma=0.8)
@@ -227,7 +227,7 @@ if __name__=='__main__':
                              device, epoch,
                              cfg['print_interval'],
                              cfg['accum_steps'],
-                             'vis_db2db1')
+                             'vis_attnblur')
         scheduler.step()
         ckpt = os.path.join(cfg['checkpoint_dir'], f"refiner_ep{epoch:02d}.pth")
         torch.save(model.state_dict(), ckpt)
