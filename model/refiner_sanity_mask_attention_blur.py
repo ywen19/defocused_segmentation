@@ -265,6 +265,7 @@ class RefinerMixedHybrid(nn.Module):
                  wavelet_list:List[str]|None=None, in_channels:int=3,
                  err_channels:int=2, heads:int=4):
         super().__init__()
+        self.dropout_prob = dropout_prob 
         self.encoder = WaveletEncoderHybrid(base_channels,dropout_prob,wavelet_list,
                                             in_channels,err_channels,heads)
         c2 = base_channels*2; hf_ch = 3*in_channels
