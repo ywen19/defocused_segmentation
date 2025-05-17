@@ -1,275 +1,283 @@
-import cv2
+import os, sys, gc
+import json
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import masks_to_boxes
+import torch.optim as optim
+from torch.amp import autocast, GradScaler
+import matplotlib.pyplot as plt
+from torchvision.transforms.functional import gaussian_blur
+from pytorch_wavelets import DWTForward
 import numpy as np
+from kornia.losses import SSIMLoss
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
+from dataload.build_dataloaders import build_dataloaders
+from model.refiner_sanity_mask_attention_blur import RefinerMixedHybrid, multi_dwt_mixed
+
+global gate_history
+gate_history = []
+
+# log tracking
+class AvgMeter:
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.sum = 0.0
+        self.count = 0
+    def update(self, val, n=1):
+        self.sum += val * n
+        self.count += n
+    @property
+    def avg(self):
+        return self.sum / self.count if self.count > 0 else 0.0
+
+class MetricLogger(dict):
+    def update(self, metrics: dict, n=1):
+        """
+        metrics: {'mad': 0.01, 'mse': 1e-4, ...}
+        n: batch 大小
+        """
+        for name, value in metrics.items():
+            if name not in self:
+                self[name] = AvgMeter()
+            self[name].update(value, n)
+    def summary(self) -> dict:
+        """
+        返回一个字典：{'mad': avg_mad, 'mse': avg_mse, ...}
+        """
+        return {name: meter.avg for name, meter in self.items()}
 
 
-def generate_trimap_from_gt(gt, fg_thresh=0.95, bg_thresh=0.05, dilation=20):
+# loss calculation
+ssim_loss = SSIMLoss(window_size=11, reduction='mean')
+wave1     = DWTForward(J=1, mode='zero', wave='haar')
+wave2     = DWTForward(J=2, mode='zero', wave='haar')
+
+def get_soft_edges(mask):
+    lap = torch.tensor([[0,1,0],[1,-4,1],[0,1,0]],
+                       device=mask.device, dtype=mask.dtype).view(1,1,3,3)
+    e = torch.abs(F.conv2d(mask, lap, padding=1))
+    return e / (e.max() + 1e-6)
+
+
+def soft_boundary_loss(p, g, sigma=1.0):
+    return F.l1_loss(gaussian_blur(p, [5,5], sigma=sigma),
+                     gaussian_blur(g, [5,5], sigma=sigma))
+
+def gradient_loss(p, g):
+    return (F.l1_loss(p[:,:,:,1:]-p[:,:,:,:-1],
+                      g[:,:,:,1:]-g[:,:,:,:-1]) +
+            F.l1_loss(p[:,:,1:,:]-p[:,:,:-1,:],
+                      g[:,:,1:,:]-g[:,:, :-1,:]))
+
+def compute_dwt_loss(rf, gt, model, wavelet_list, lam_hf=1.0):
     """
-    从 ground truth alpha matte 生成 trimap（0: 背景，0.5: unknown，1: 前景）
-    Args:
-        gt: (B, 1, H, W) 的 float tensor，范围 [0, 1]
-        fg_thresh: 超过该值为前景
-        bg_thresh: 低于该值为背景
-        dilation: unknown 区域宽度（像素）
-
-    Returns:
-        trimap: 同 shape 的 float tensor，值域为 {0.0, 0.5, 1.0}
+    Compute DWT-based high-frequency supervision loss between rf and gt.
+    Returns ll_loss and hf_loss.
     """
-    fg = (gt >= fg_thresh).float()
-    bg = (gt <= bg_thresh).float()
-    unknown = 1.0 - fg - bg
+    coeffs_rf = multi_dwt_mixed(rf, wavelet_list)
+    coeffs_gt = multi_dwt_mixed(gt, wavelet_list)
 
-    # 对 fg/bg 做膨胀，扩大 unknown 区域
-    kernel_size = dilation * 2 + 1
-    pad = dilation
-    fg_dilated = F.max_pool2d(fg, kernel_size=kernel_size, stride=1, padding=pad)
-    bg_dilated = F.max_pool2d(bg, kernel_size=kernel_size, stride=1, padding=pad)
+    # 假设 multi_dwt_mixed 最后一项是 (LL, [HF...], name_str)
+    ll_rf, hf_rf_list, _ = coeffs_rf[-1]
+    ll_gt, hf_gt_list, _ = coeffs_gt[-1]
 
-    new_unknown = ((fg_dilated - fg) + (bg_dilated - bg)).clamp(0, 1)
+    # 低频 L1
+    ll_loss = F.l1_loss(ll_rf, ll_gt)
 
-    trimap = fg * 1.0 + new_unknown * 0.5 + bg * 0.0
-    return trimap
+    # 高频 L1，确保 zip 里的全是 Tensor
+    hf_loss = 0.0
+    for p_h, g_h in zip(hf_rf_list, hf_gt_list):
+        hf_loss += F.l1_loss(p_h, g_h)
+    hf_loss = lam_hf * hf_loss
 
-def extract_unknown_mask(trimap, strategy='auto', threshold=0.1):
-    if trimap.ndim == 3:
-        trimap = trimap.unsqueeze(1)
+    return ll_loss, hf_loss
 
-    is_float = trimap.dtype in [torch.float32, torch.float64]
-    
-    if strategy == 'fixed':
-        unknown_mask = (trimap == 128).float()
-    
-    elif strategy == 'range':
-        if is_float:
-            lower, upper = 0.5 - threshold, 0.5 + threshold
+
+def compute_phase1_loss(rf, gt, wave1, accum_steps=1):
+    """
+    Phase 1 losses: weighted L1, soft boundary, wave1, gradient, SSIM.
+    """
+    w1 = torch.where(gt > 0.9, torch.ones_like(gt),
+               torch.where(gt < 0.1, 0.3 * torch.ones_like(gt),
+                           1.5 * torch.ones_like(gt)))
+    l1 = (F.l1_loss(rf, gt, reduction='none') * w1).mean()
+    lsoft = soft_boundary_loss(rf, gt)
+    with autocast('cuda', enabled=False):
+        _, gh1 = wave1(gt.float())
+        _, ph1 = wave1(rf.float())
+        lw1 = sum(F.l1_loss(p, g) for p, g in zip(ph1, gh1)) / len(ph1)
+    lgrad = gradient_loss(rf, gt) + gradient_loss(F.avg_pool2d(rf, 2), F.avg_pool2d(gt, 2))
+    lssim = ssim_loss(rf, gt)
+    total = (1.0 * l1 + 1.0 * lsoft + 0.5 * lw1 + 0.5 * lgrad + 0.2 * lssim) / accum_steps
+    return total, l1/accum_steps, lsoft/accum_steps, lw1/accum_steps, lgrad/accum_steps, lssim/accum_steps
+
+
+def compute_phase2_loss(gt, gd, ug, gate_pix, model, accum_steps=1,
+                        eps=0.02, lam_pos=3.0, lam_neg=1.0, lam_hf=1.0):
+    """
+    Phase 2 losses: residual supervision and high-frequency DWT supervision.
+    """
+    # Residual supervision
+    res_pos = gt - gd
+    res_neg = gd - gt
+    mask_pos = (res_pos > eps).float()
+    mask_neg = (res_neg > eps).float()
+    pred_pos = gate_pix * (ug - gd)
+    pred_neg = gate_pix * (gd - ug)
+    loss = lam_pos * F.l1_loss(pred_pos * mask_pos, res_pos * mask_pos)
+    loss += lam_neg * F.l1_loss(pred_neg * mask_neg, res_neg * mask_neg)
+    # High-frequency DWT
+    _, hf_loss = compute_dwt_loss((gd + gate_pix*(ug-gd)).clamp(0,1), gt,
+                                  model, model.encoder.wavelet_list, lam_hf)
+    loss += hf_loss
+    return loss / accum_steps
+
+
+def compute_phase3_loss(gt, gd, ug, gate, sm, model, accum_steps=1,
+                        lam_hf=1.0, sub3=1):
+    """
+    Phase 3 losses: gate regularization, branch supervision, DWT supervision.
+    """
+    gate_pix = F.interpolate(gate.float(), gd.shape[-2:], mode='bilinear', align_corners=False)
+    loss = 0
+    if sub3 == 2:
+        mean_sm = sm.mean(dim=1, keepdim=True)
+        loss += F.l1_loss(gate_pix, mean_sm)
+        H = -(gate_pix*torch.log(gate_pix+1e-6) + (1-gate_pix)*torch.log(1-gate_pix+1e-6))
+        loss += 0.02*(H*(mean_sm+1e-2)).mean() + 0.02*gate_pix.mean()
+    # Branch supervision
+    loss += 0.5*F.l1_loss(gd, gt) + 0.3*F.l1_loss(ug*get_soft_edges(gt), gt*get_soft_edges(gt))
+    # DWT supervision
+    # Low-frequency
+    ll_loss, _ = compute_dwt_loss(gt, gt, model, model.encoder.wavelet_list, lam_hf=0)
+    # For simplicity, reuse compute_dwt_loss on fused->gt
+    fused = (gd + gate_pix*(ug-gd)).clamp(0,1)
+    ll_loss, hf_loss = compute_dwt_loss(fused, gt, model, model.encoder.wavelet_list, lam_hf)
+    loss += ll_loss + hf_loss
+    return loss / accum_steps
+
+
+# visualization
+def save_visualization(rgb, init_m, gt,
+                       refined, guided, unguided,
+                       gate, err_map, save_path,
+                       max_history=500):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    r,i,gt0,rf,gd,ug,gtmp,em = (
+        rgb[0], init_m[0], gt[0],
+        refined[0], guided[0], unguided[0],
+        gate[0], err_map[0]
+    )
+    def to_np(x):
+        a = x.detach().cpu().numpy()
+        if a.ndim==3:
+            return a.transpose(1,2,0) if a.shape[0]==3 else a[0]
+        return a
+
+    imgs = [to_np(t) for t in (r,i,gt0,rf,gd,ug,gtmp, em[0], em[1])]
+    cont = np.clip(np.abs(to_np(rf)-to_np(gt0))/0.05,0,1)
+    absd = np.clip(np.abs(to_np(rf)-to_np(gt0)),0,1)
+    imgs += [cont, absd]
+
+    titles = ["RGB","Init","GT","Refined","Guided","Unguided",
+              "Gate","Err_pos","Err_neg","ContErr","AbsErr","Gate μ Curve"]
+    cmaps  = [None,"gray","gray","gray","gray","gray",
+              "viridis","hot","hot","hot","hot", None]
+
+    fig, axs = plt.subplots(3,4, figsize=(20,15))
+    for ax, img, ttl, cmap in zip(axs.flatten()[:11], imgs, titles[:11], cmaps[:11]):
+        if cmap:
+            ax.imshow(img, cmap=cmap, vmin=0, vmax=1)
         else:
-            lower, upper = 128 - threshold, 128 + threshold
-        unknown_mask = ((trimap >= lower) & (trimap <= upper)).float()
+            ax.imshow(img)
+        ax.set_title(ttl); ax.axis("off")
 
-    elif strategy == 'auto':
-        unique_vals = torch.unique(trimap)
-        if is_float:
-            # 强化：使用 threshold 控制范围，而不是固定0.1/0.9
-            lower, upper = threshold, 1.0 - threshold
-            unknown_mask = ((trimap > lower) & (trimap < upper)).float()
-        elif unique_vals.numel() == 3:
-            sorted_vals = unique_vals.sort()[0]
-            unknown_val = sorted_vals[1]
-            unknown_mask = (trimap == unknown_val).float()
-        else:
-            unknown_mask = ((trimap > 25) & (trimap < 230)).float()
+    ax = axs.flatten()[11]
+    hist = gate_history[-max_history:]
+    ax.plot(hist, '.-', linewidth=1, markersize=2)
+    ax.set_title(f"Gate μ (last {len(hist)} steps)")
+    ax.set_xlabel("Step"); ax.set_ylabel("μ")
+    ax.set_ylim(0,1); ax.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close(fig)
+
+# metrics calculation
+_sobel_x = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]],
+                        dtype=torch.float32).view(1,1,3,3)/8
+_sobel_y = _sobel_x.transpose(2,3)
+
+KX, KY = None, None
+
+def _init_kernels(device, dtype):
+    global KX, KY
+    if KX is None or KX.device != device:
+        KX = _sobel_x.to(device, dtype)
+        KY = _sobel_y.to(device, dtype)
+
+
+@torch.no_grad()
+def matte_metrics(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    trimap: torch.Tensor,
+    unknown_mask: torch.Tensor = None,
+    esw_const: float = 2.563,
+    edge_thresh: float = 5e-3,
+) -> dict:
+    # 1) 初始化 Sobel 核
+    _init_kernels(pred.device, pred.dtype)
+
+    # 2) 计算前景泄漏 MAE (trimap==1 区域)
+    fg_mask = (trimap == 1.0).float()
+    N_fg    = torch.clamp_min(fg_mask.sum([1,2,3]), 1.0)
+    fg_mae  = ((pred - gt).abs() * fg_mask).sum([1,2,3]) / N_fg
+
+    # 3) 计算灰带指标区域
+    if unknown_mask is None:
+        unknown_mask = ((gt > 0) & (gt < 1)).float()
     else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-    
-    return unknown_mask
+        unknown_mask = unknown_mask.float()
+    N = torch.clamp_min(unknown_mask.sum([1,2,3]), 1.0)
+    diff = pred - gt
 
+    # 4) MAD / MSE
+    mad = (diff.abs()   * unknown_mask).sum([1,2,3]) / N
+    mse = (diff.square() * unknown_mask).sum([1,2,3]) / N
 
-def compute_mse_with_trimap(pred, gt, trimap):
-    pred, gt, trimap = pred.float(), gt.float(), trimap.float()
-    unknown_mask = extract_unknown_mask(trimap)
-    diff = (pred - gt) ** 2 * unknown_mask
-    mse_per_image = diff.sum(dim=[1, 2, 3]) / (unknown_mask.sum(dim=[1,2,3]) + 1e-6)
-    return mse_per_image.mean()
+    # 5) Grad Error (Sobel) over unknown
+    gx = F.conv2d(pred, KX, padding=1); gy = F.conv2d(pred, KY, padding=1)
+    gpred = torch.sqrt(gx*gx + gy*gy + 1e-12)
+    gx = F.conv2d(gt,   KX, padding=1); gy = F.conv2d(gt,   KY, padding=1)
+    ggt   = torch.sqrt(gx*gx + gy*gy + 1e-12)
+    grad_err = ((gpred - ggt).abs() * unknown_mask).sum([1,2,3]) / N
 
-def compute_sad_with_trimap(pred, gt, trimap, normalize=True):
-    pred, gt, trimap = pred.float(), gt.float(), trimap.float()
-    unknown_mask = extract_unknown_mask(trimap, strategy='auto')
-    diff = torch.abs(pred - gt) * unknown_mask
-    sad_per_image = diff.sum(dim=[1, 2, 3])
+    # 6) ESW-Error：先算 GT 梯度 & 边缘掩码
+    gx = F.conv2d(gt,   KX, padding=1); gy = F.conv2d(gt,   KY, padding=1)
+    ggt = torch.sqrt(gx*gx + gy*gy + 1e-12)
+    edge_mask = (ggt > edge_thresh).float()
 
-    if normalize:
-        area = unknown_mask.sum(dim=[1, 2, 3])
-        sad_per_image = sad_per_image / (area + 1e-6) * 1000.0
+    # 7) 预测梯度
+    gx = F.conv2d(pred, KX, padding=1); gy = F.conv2d(pred, KY, padding=1)
+    gpred = torch.sqrt(gx*gx + gy*gy + 1e-12)
 
-    return sad_per_image.mean()
+    # 8) 只在灰带 & GT 真边缘上算 ESW
+    valid = (unknown_mask * edge_mask)
+    N_esw = torch.clamp_min(valid.sum([1,2,3]), 1.0)
+    esw_p = esw_const / (gpred + 1e-6)
+    esw_g = esw_const / (ggt   + 1e-6)
+    esw_err = ((esw_p - esw_g).abs() * valid).sum([1,2,3]) / N_esw
+    esw_err = torch.log1p(esw_err)
 
-def get_sobel_gradients(x):
-    x = x.float()
-    kernel_x = torch.tensor(
-        [[1, 0, -1], [2, 0, -2], [1, 0, -1]],
-        dtype=torch.float32,
-        device=x.device
-    ).view(1, 1, 3, 3)
-    kernel_y = torch.tensor(
-        [[1, 2, 1], [0, 0, 0], [-1, -2, -1]],
-        dtype=torch.float32,
-        device=x.device
-    ).view(1, 1, 3, 3)
-    gx = F.conv2d(x, kernel_x, padding=1)
-    gy = F.conv2d(x, kernel_y, padding=1)
-    return gx, gy
-
-def largest_connected_component(mask):
-    B, _, H, W = mask.shape
-    result = torch.zeros_like(mask)
-
-    for i in range(B):
-        bin_mask = (mask[i, 0] > 0.5).float().cpu().numpy().astype('uint8')
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
-        if num_labels <= 1:
-            continue
-        largest = 1 + stats[1:, cv2.CC_STAT_AREA].argmax()
-        result[i, 0] = torch.from_numpy((labels == largest).astype('float32')).to(mask.device)
-
-    return result
-
-def compute_conn_with_unknown_mask(pred, gt, trimap, threshold=0.5):
-    B, C, H, W = pred.shape
-    assert C == 1
-    pred, gt, trimap = pred.float(), gt.float(), trimap.float()
-    unknown_mask = extract_unknown_mask(trimap)
-    losses = []
-
-    with torch.no_grad():
-        gt_bin = (gt > threshold).float()
-        main_region_mask = largest_connected_component(gt_bin)
-
-    for i in range(B):
-        gt_main_tensor = main_region_mask[i:i+1]
-        eval_mask = (gt_main_tensor * unknown_mask[i:i+1]).clamp(0, 1)
-
-        if eval_mask.sum() < 1:
-            losses.append(torch.tensor(0.0, device=pred.device))
-            continue
-
-        bce = F.binary_cross_entropy(
-            pred[i:i+1] * eval_mask,
-            gt_main_tensor * eval_mask,
-            reduction='sum'
-        )
-        norm = eval_mask.sum().clamp(min=1.0)
-        losses.append(bce / norm)
-
-    return torch.stack(losses).mean()
-
-def compute_grad_metric(pred_alpha, gt_alpha, trimap, eps=1e-6):
-    pred_alpha, gt_alpha = pred_alpha.float(), gt_alpha.float()
-    def _grad_xy(x):
-        kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]],dtype=torch.float32,device=x.device).view(1,1,3,3)
-        ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]],dtype=torch.float32,device=x.device).view(1,1,3,3)
-        return F.conv2d(x,kx,padding=1), F.conv2d(x,ky,padding=1)
-
-    pgx, pgy = _grad_xy(pred_alpha)
-    ggx, ggy = _grad_xy(gt_alpha)
-    unk = extract_unknown_mask(trimap)
-    dx = torch.abs(pgx - ggx) * unk
-    dy = torch.abs(pgy - ggy) * unk
-    area = unk.sum(dim=[1,2,3]) + eps
-    per_err = (dx.sum(dim=[1,2,3]) + dy.sum(dim=[1,2,3])) / (2 * area)
-    return per_err.mean()
-
-def compute_grad_loss_soft_only(pred_alpha, gt_alpha, coarse_mask=None, trimap=None, use_trimap=False,
-                                lower=0.05, upper=0.95):
-    pred_alpha, gt_alpha = pred_alpha.float(), gt_alpha.float()
-
-    def _grad(x):
-        kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=torch.float32, device=x.device).view(1,1,3,3)
-        ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=torch.float32, device=x.device).view(1,1,3,3)
-        return F.conv2d(x, kx, padding=1), F.conv2d(x, ky, padding=1)
-
-    pgx, pgy = _grad(pred_alpha)
-    ggx, ggy = _grad(gt_alpha)
-
-    soft = ((gt_alpha > lower) & (gt_alpha < upper)).float()
-    if coarse_mask is not None:
-        soft *= ((coarse_mask > lower) & (coarse_mask < upper)).float()
-    if use_trimap and trimap is not None:
-        from utils import extract_unknown_mask
-        soft *= extract_unknown_mask(trimap, strategy='auto', threshold=0.1)
-
-    edge = torch.sqrt(ggx**2 + ggy**2 + 1e-6)
-    weight = edge / (edge.max() + 1e-6)
-    wm = soft * weight
-
-    dx = torch.abs(pgx - ggx) * wm
-    dy = torch.abs(pgy - ggy) * wm
-
-    return (dx.sum() + dy.sum()) / (wm.sum() + 1e-6) / 2
-
-
-def compute_conn_mismatch_loss(pred_alpha, gt_alpha, threshold=0.5):
-    pred_alpha, gt_alpha = pred_alpha.float(), gt_alpha.float()
-    gt_bin = (gt_alpha > threshold).to(pred_alpha.dtype)
-    pred_bin = (pred_alpha > threshold).float()
-    mismatch = torch.abs(gt_bin - pred_bin)
-    bce = F.binary_cross_entropy(pred_alpha, gt_bin, reduction='none')
-    masked = bce * mismatch
-    return masked.sum()/(mismatch.sum()+1e-6)
-
-def compute_cf_loss(pred_alpha, gt_alpha, trimap=None, use_trimap=False,
-                    lower=0.05, upper=0.95, eps=1e-6):
-    pred_alpha, gt_alpha = pred_alpha.float(), gt_alpha.float()
-    soft = ((gt_alpha>lower)&(gt_alpha<upper)).float()
-    if use_trimap and trimap is not None:
-        soft *= extract_unknown_mask(trimap)
-    loss_map = (pred_alpha - gt_alpha)**2
-    masked = loss_map * soft
-    return masked.sum()/(soft.sum()+eps)
-
-def compute_ctr_loss(anchor_feat, positive_feat, pred_mask, gt_mask, margin=0.2, use_triplet=True, debug=False):
-    B, C, H, W = anchor_feat.shape
-
-    # Downsample pred and gt to match feature resolution
-    pred_mask = F.interpolate(pred_mask, size=(H, W), mode='bilinear', align_corners=False)
-    gt_mask = F.interpolate(gt_mask, size=(H, W), mode='bilinear', align_corners=False)
-
-    with torch.no_grad():
-        false_pos = (pred_mask > 0.5) & (gt_mask <= 0.5)
-        false_neg = (pred_mask <= 0.5) & (gt_mask > 0.5)
-
-    def extract_feat(feat, mask):
-        masked_feat = feat * mask.unsqueeze(1)
-        return F.adaptive_avg_pool2d(masked_feat, 1).view(B, C)
-
-    anchor_fp = extract_feat(anchor_feat, false_pos.float())
-    anchor_fn = extract_feat(anchor_feat, false_neg.float())
-    pos_fp = extract_feat(positive_feat, false_pos.float())
-    pos_fn = extract_feat(positive_feat, false_neg.float())
-
-    sim_pos_fp = F.cosine_similarity(anchor_fp, pos_fp, dim=1)
-    sim_pos_fn = F.cosine_similarity(anchor_fn, pos_fn, dim=1)
-
-    if use_triplet:
-        loss_fp = F.relu(1.0 - sim_pos_fp + margin)
-        loss_fn = F.relu(1.0 - sim_pos_fn + margin)
-    else:
-        loss_fp = 1.0 - sim_pos_fp
-        loss_fn = 1.0 - sim_pos_fn
-
-    loss = (loss_fp.mean() + loss_fn.mean()) / 2.0
-
-    if debug:
-        print(f"[CTR Spatial] sim_fp: {sim_pos_fp.mean().item():.4f}, sim_fn: {sim_pos_fn.mean().item():.4f}, loss: {loss.item():.4f}")
-
-    return loss
-
-# ------------------- Embedding Contrastive Loss ----------------------
-def compute_embedding_ctr_loss(anchor_embed, positive_embed, margin=0.2, use_triplet=True, debug=False):
-    anchor_embed = F.normalize(anchor_embed, dim=1)
-    positive_embed = F.normalize(positive_embed, dim=1)
-
-    sim = F.cosine_similarity(anchor_embed, positive_embed, dim=1)
-
-    if use_triplet:
-        loss = F.relu(1.0 - sim + margin).mean()
-    else:
-        loss = (1 - sim).mean()
-
-    if debug:
-        print(f"[Embed CTR] sim: {sim.mean().item():.4f}, loss: {loss.item():.4f}")
-
-    return loss
-
-
-def compute_sad_loss(pred_alpha, gt_alpha, trimap=None, use_trimap=False, lower=0.1, upper=0.9):
-    pred_alpha, gt_alpha = pred_alpha.float(), gt_alpha.float()
-    soft = ((gt_alpha > lower) & (gt_alpha < upper)).float()
-    if use_trimap and trimap is not None:
-        from utils import extract_unknown_mask
-        soft *= extract_unknown_mask(trimap, strategy='auto', threshold=0.1)
-    absd = torch.abs(pred_alpha - gt_alpha)
-    loss = absd * soft
-    return loss.sum() / (soft.sum() + 1e-6)
-
+    # 9) 返回所有指标
+    return {
+        'mae':  fg_mae.mean().item(),
+        'mad':  mad.mean().item(),
+        'mse':  mse.mean().item(),
+        'grad': grad_err.mean().item(),
+        'esw':  esw_err.mean().item(),
+    }
