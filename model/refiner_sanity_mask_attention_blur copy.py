@@ -310,82 +310,99 @@ class RefinerMixedHybrid(nn.Module):
                 nn.init.constant_(m.bias, torch.logit(torch.tensor(0.4)))
                 break
         self.err_dropout_prob = err_dropout_prob
-        #nn.init.constant_(self.to_mask_u.bias, -2.0)
 
     def forward(self, rgb: torch.Tensor, init_mask: torch.Tensor, err_map: torch.Tensor = None, stage: str = None):
         """
-        Returns (refined, mg, mu, gate_p, err_pred_full)
+        Returns (refined, mg, mu, gate_p, err_pred_full).
+        Stage controls computation paths:
+        - 'guided_only': ErrMapPred zeroed, unguided/gate frozen
+        - 'unguided_only': ...
+        - None: full trainable
         """
-
+        # prepare full-resolution error map input
         err_ch = self.err_head[-1].out_channels
+        # default err_map_in is zeros
         err_map_in = err_map if err_map is not None else torch.zeros_like(init_mask).repeat(1, err_ch, 1, 1)
-
-        # --------------------------------------------------
-        # Stage 1: Guided-only
-        # --------------------------------------------------
+        # guided-only: force err_map_in to zero
         if stage == 'guided_only':
-            # force err_map to zero
             err_map_in = torch.zeros_like(err_map_in)
 
-            # guided path
-            fused_g, coeffs_g = self.encoder_g(rgb, init_mask, err_map_in)
-            m_ds = init_mask
-            for _ in range(self.encoder_g.levels):
-                m_ds = self.encoder_g.mask_down(m_ds)
+        # guided encoder + error prediction
+        fused_g, coeffs_g = self.encoder_g(rgb, init_mask, err_map_in)
+        m_ds = init_mask
+        for _ in range(self.encoder_g.levels):
+            m_ds = self.encoder_g.mask_down(m_ds)
 
-            raw_err = self.err_head(torch.cat([fused_g, m_ds], dim=1))
-            err_pred_ds = torch.zeros_like(raw_err)
+        raw_err = self.err_head(torch.cat([fused_g, m_ds], dim=1))
+        # guided-only: zero out err_pred
+        if stage == 'guided_only':
+            err_pred_ds   = torch.zeros_like(raw_err)
             err_pred_full = torch.zeros_like(init_mask).repeat(1, err_ch, 1, 1)
+        else:
+            err_pred_ds   = torch.sigmoid(raw_err)
+            err_pred_full = F.interpolate(
+                err_pred_ds, size=init_mask.shape[-2:], mode='bilinear', align_corners=False
+            )
 
-            dec_g = self.decoder_g(fused_g, coeffs_g, m_ds, ll_skip=self.encoder_g.ll_feats[-1], err_map_ds=err_pred_ds)
-            mg = torch.sigmoid(self.to_mask(dec_g))
+        # guided decoder
+        dec_g = self.decoder_g(
+            fused_g, coeffs_g, m_ds,
+            ll_skip=self.encoder_g.ll_feats[-1],
+            err_map_ds=err_pred_ds
+        )
+        mg = torch.sigmoid(self.to_mask(dec_g))
 
-            # unguided dummy
-            mu = torch.zeros_like(mg)
-            # gate = 0 → only guided
-            gate_p = torch.zeros_like(mg)
-
-        # --------------------------------------------------
-        # Stage 2: Unguided-only
-        # --------------------------------------------------
-        elif stage == 'unguided_only':
-            # err map 冷启动：训练初期避免扰动 decoder_u
-            if self.training and torch.rand(1).item() < self.err_dropout_prob:
-                err_map_in = torch.zeros_like(err_map_in)
-
-            # 用 guided encoder 获取 err_map（无需梯度）
+        # unguided encoder & decoder
+        if stage == 'guided_only':
             with torch.no_grad():
-                fused_g, coeffs_g = self.encoder_g(rgb, init_mask, err_map_in)
-                m_ds = init_mask
-                for _ in range(self.encoder_g.levels):
-                    m_ds = self.encoder_g.mask_down(m_ds)
-                raw_err = self.err_head(torch.cat([fused_g, m_ds], dim=1))
-                err_pred_ds = torch.sigmoid(raw_err)
-                err_pred_full = F.interpolate(err_pred_ds, size=init_mask.shape[-2:], mode='bilinear', align_corners=False)
-
-            # guided dummy 输出
-            mg = torch.zeros_like(init_mask)
-
-            # unguided 编码
-            fused_u, coeffs_u = self.encoder_u(rgb, init_mask, torch.zeros_like(err_pred_full))  # ← 禁用 err_map
-            mu_ds = init_mask
+                init_u = torch.zeros_like(init_mask)
+                fused_u, coeffs_u = self.encoder_u(rgb, init_u, err_pred_full)
+                mu_ds = init_u
+                for _ in range(self.encoder_u.levels):
+                    mu_ds = self.encoder_u.mask_down(mu_ds)
+                dec_u = self.decoder_u(
+                    fused_u, coeffs_u, mu_ds,
+                    ll_skip=self.encoder_u.ll_feats[-1],
+                    err_map_ds=err_pred_ds
+                )
+                mu = torch.sigmoid(self.to_mask_u(dec_u))
+        else:
+            # original unguided path for other stages
+            init_u = torch.zeros_like(init_mask)
+            fused_u, coeffs_u = self.encoder_u(rgb, init_u, err_pred_full)
+            mu_ds = init_u
             for _ in range(self.encoder_u.levels):
                 mu_ds = self.encoder_u.mask_down(mu_ds)
-
             dec_u = self.decoder_u(
                 fused_u, coeffs_u, mu_ds,
                 ll_skip=self.encoder_u.ll_feats[-1],
-                err_map_ds=torch.zeros_like(err_pred_ds)  # ← 禁用 err_map
+                err_map_ds=err_pred_ds
             )
             mu = torch.sigmoid(self.to_mask_u(dec_u))
 
-            # gate 恒为 1，refined = mu
-            gate_p = torch.ones_like(mu)
+        # gate fusion
+        gate = self.gate_head(fused_g, err_pred_ds.detach(), m_ds)
+        gate_p = gate
+        for _ in range(self.encoder_g.levels):
+            gate_p = self.up(gate_p)
+        # guided-only: force gate_p = 0 → refined = mg
+        if stage == 'guided_only':
+            gate_p = torch.zeros_like(gate_p)
+        elif stage == 'unguided_only':
+            gate_p = torch.ones_like(gate_p)
+        # otherwise keep learned gate_p
 
         refined = mg + gate_p * (mu - mg)
-        return refined, mg, mu, gate_p, err_pred_full, fused_u # fused_u: temp debug
+        return refined, mg, mu, gate_p, err_pred_full
 
-
+# Quick test
+if __name__ == '__main__':
+    B,C,H,W = 2,3,256,256
+    x = torch.randn(B,C,H,W)
+    m0 = torch.rand(B,1,H,W)
+    model = RefinerMixedHybrid(base_channels=32, dropout_prob=0.3, wavelet_list=['db4','db2','db1'], err_channels=2, heads=4)
+    refined, mg, mu, gp, err_full = model(x, m0)
+    print('outputs:', refined.shape, mg.shape, mu.shape, gp.shape, err_full.shape)
 # Quick test replaced
 if __name__ == '__main__':
     B,C,H,W = 2,3,256,256
@@ -393,7 +410,5 @@ if __name__ == '__main__':
     m0 = torch.rand(B,1,H,W)
     model = RefinerMixedHybrid(base_channels=32, dropout_prob=0.3, wavelet_list=['db4','db2','db1'], err_channels=2, heads=4)
     refined, mg, mu, gate_p, err_pred = model(x, m0, stage='guided_only')
-    print('outputs:', refined.shape, mg.shape, mu.shape, gate_p.shape, err_pred.shape)
-    refined, mg, mu, gate_p, err_pred = model(x, m0, stage='unguided_only')
-    print('outputs:', refined.shape, mg.shape, mu.shape, gate_p.shape, err_pred.shape)
+    print('outputs:', refined.shape, mg.shape, mu.shape, gp.shape, err_full.shape)
 

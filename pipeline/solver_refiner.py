@@ -11,6 +11,7 @@ Refiner training with enhanced curriculum & dual‐channel ErrMap:
 """
 
 import os, sys, gc
+import itertools 
 import json
 import torch
 import torch.nn as nn
@@ -30,215 +31,218 @@ from model.refiner_sanity_mask_attention_blur import RefinerMixedHybrid, multi_d
 from pipeline.utils import *
 
 
-def train_one_epoch(model, loader, opt, scaler, device,
-                    epoch, print_int, accum_steps, vis_dir,
+def get_stage(epoch):
+    if epoch < 3:
+        return 'guided_only'
+    elif 3 <= epoch <= 4:
+        return 'unguided_only'
+    elif 4 <= epoch <= 5:
+        return 'fuse_training'
+    else:
+        return 'hf_detail'
+
+def apply_stage_overrride(stage, gate_p) -> torch.Tensor:
+    """
+    根据 stage 强制覆盖 gate_p 为常数。
+
+    Args:
+        gate_p:    原始上采样后的 gate 权重张量，shape = [B,1,H,W]
+        stage:     'guided_only' 或 'unguided_only'；其他值则返回原 gate_p
+        guided_value:    在 guided_only 时用的常数
+        unguided_value:  在 unguided_only 时用的常数
+
+    Returns:
+        一个同 shape 的 Tensor，其中所有元素都被替换成对应阶段的常数。
+    """
+    if stage == 'guided_only':
+        return torch.zeros_like(gate_p)
+    elif stage == 'unguided_only':
+        return torch.full_like(gate_p, 1.0)
+    else:
+        return gate_p
+
+def freeze_module(module, freeze: bool = True):
+    for p in module.parameters():
+        p.requires_grad = not freeze
+
+
+def apply_stage_control(model, epoch):
+    stage = get_stage(epoch)
+
+    # 解冻所有参数作为初始化
+    for p in model.parameters():
+        p.requires_grad = True
+
+    if stage == 'guided_only':
+        print("→ Stage 1: Only Guided branch active")
+        freeze_module(model.encoder_g, False)
+        freeze_module(model.decoder_g, False)
+        freeze_module(model.err_head,   True)
+        freeze_module(model.to_mask,    False) 
+
+        # —— 冻结（requires_grad=False）——
+        freeze_module(model.encoder_u,  True)
+        freeze_module(model.decoder_u,  True)
+        freeze_module(model.to_mask_u,  True)
+        freeze_module(model.gate_head,  True)
+        freeze_module(model.up,         True)  
+    
+
+def build_optimizer(model, base_lr, weight_decay):
+    params = filter(lambda p: p.requires_grad, model.parameters())
+    return optim.Adam(params, lr=base_lr, weight_decay=weight_decay)
+
+
+def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
+                    print_interval, accum_steps, vis_dir,
                     loss_log_path, metrics_log_path):
-    model.train(); opt.zero_grad()
-    train_logger = MetricLogger()
 
-    for i, (rgb, init_m, gt, trimap) in enumerate(loader, 1):
-        rgb, init_m, gt , trimap = rgb.to(device), init_m.to(device), gt.to(device), trimap.to(device)
+    model.train()
+    loss_logger = MetricLogger()
+    metrics_logger = MetricLogger()
+    os.makedirs(vis_dir, exist_ok=True)
 
-        # Prepare inputs
-        decay = max(0.2, 1.0 - epoch/10)
-        mg = torch.where(init_m>0.99, init_m, init_m*decay)
-        if torch.rand(1)<(0.1 if epoch<5 else 0.5): mg.zero_()
-        err_pos = F.relu(gt-mg); err_neg = F.relu(mg-gt)
-        sm = torch.cat([err_pos, err_neg],1).clamp(0,1)
-        # Forward
-        with autocast('cuda'):
-            refined, gd, ug_dummy, gate = model(rgb, mg, sm)
-        with torch.no_grad(), autocast('cuda'):
-            _, ug, _, _ = model(rgb, torch.zeros_like(mg), sm)
+    stage = get_stage(epoch)
+    model.err_dropout_prob = get_err_dropout_prob(epoch)
 
-        gd, ug, gate = gd.float(), ug.float(), gate.float()
-        gate_history.append(gate.mean().item())
-        gate_pix = F.interpolate(gate, gd.shape[-2:], mode='bilinear', align_corners=False)
-        rf = (gd + gate_pix * (ug - gd)).clamp(0, 1)  
+    optimizer.zero_grad()
 
-        # Compute losses
-        loss, l1, lsoft, lw1, lgrad, lssim = compute_phase1_loss(rf, gt, wave1, accum_steps)
-        if epoch>3:
-            loss += compute_phase2_loss(gt, gd, ug,
-                         F.interpolate(gate,gd.shape[-2:],mode='bilinear',align_corners=False),
-                         model, accum_steps)
-        if epoch>6:
-            sub3 = 1 if epoch<11 else 2
-            loss += compute_phase3_loss(gt, gd, ug, gate, sm,
-                                         model, accum_steps, sub3=sub3)
-        if epoch%5==0:
-            loss, _, _, _, _, _ = compute_phase1_loss(rf, gt, wave1, accum_steps)
+    for step, batch in enumerate(loader):
+        rgb, init_mask, gt_matte = [x.to(device) for x in batch[:3]]
 
-        # calculate metrics
-        unknown_mask = (trimap >= 0.5).float()
-        batch_metrics = matte_metrics(rf, gt, trimap=trimap, unknown_mask=unknown_mask)
-        train_logger.update(batch_metrics, n=rgb.size(0))
+        # 阶段性逻辑
+        if stage == 'guided_only':
+            with autocast(device_type=device.type):
+                outputs = model(rgb, init_mask, err_map=None, stage=stage)
 
-        # Backward
-        scaler.scale(loss).backward()
-        if i%accum_steps==0:
-            scaler.step(opt); scaler.update(); opt.zero_grad()
-        if i%print_int==0 or i==len(loader)-1:
-            avg_metrics = train_logger.summary()
-            metrics_str = "  ".join(f"{k}:{v:.4f}" for k,v in avg_metrics.items())
-            print(f"Train Epoch {epoch} [{i}/{len(loader)}] Loss: {loss.item():.4f} | Metrics: {metrics_str} ")
-            save_visualization(rgb, mg, gt, rf, gd, ug, gate, sm,
-                               os.path.join(vis_dir, f"e{epoch:02d}_s{i:04d}.png"))
-            # save out the metrics log
-            with open(metrics_log_path, "a") as f:
-                f.write(json.dumps(avg_metrics) + "\n")
-            
-            # save out the loss log
-            entry = {
-                "total": loss.item(),
-                "l1":    l1.item(),
-                "lsoft": lsoft.item(),
-                "lw1":   lw1.item(),
-                "lgrad": lgrad.item(),
-                "lssim": lssim.item()
-            }
-            with open(loss_log_path, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+            # 解包
+            (refined, guided, unguided, gate, err_map) = outputs
+            gate_const = apply_stage_overrride(stage, gate).detach()
 
+            gate_history.append(gate_const.mean().item())
 
-def val_one_epoch(model, val_loader, device, vis_dir, epoch, print_int,
-                loss_log_path, metrics_log_path):
-    """
-    Validation and visualization with loss computation.
-    """
-    model.eval()
-    total_loss = 0.0
-    count = 0
-    val_logger = MetricLogger()
+            if stage == 'guided_only':
+                if epoch < 3:
+                    loss_guided, l1_g, lsoft_g, lw1_g, lgrad_g, lssim_g = compute_phase1_loss(
+                        guided, gt_matte, guided, wave1
+                    )
+            total_loss = loss_guided + 0.4 * guided_structure_loss(gt_matte, guided) / accum_steps
+            ll_g, hf_g = compute_dwt_loss(guided.float(), gt_matte.float(), model.wavelet_list)
+            total_loss += 0.5 * ll_g / accum_steps
+            total_loss += 0.5 * hf_g / accum_steps
+            print(f"At epoch {epoch} [{step}/{len(loader)}]  | total_loss: {total_loss.mean().item()} \n")
 
-    with torch.no_grad():
-        for i, batch in enumerate(val_loader, 1):
-            rgb, init_m, gt, trimap = [x.to(device) for x in batch]
+        # 反向传播
+        scaler.scale(total_loss).backward()
+        if (step + 1) % accum_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
-            # 构建误差图 (error map)
-            err_pos = F.relu(gt - init_m)
-            err_neg = F.relu(init_m - gt)
-            sm = torch.cat([err_pos, err_neg], dim=1).clamp(0, 1)
+        if (step + 1) % print_interval == 0:
+            save_visualization(
+                rgb, init_mask, gt_matte,
+                refined, guided, unguided,
+                gate_const, err_map,
+                f"{vis_dir}/e{epoch:02d}_step{step:04d}_fill_sup.jpg",
+                hf_response=None,
+            )
 
-            # 模型前向
-            with autocast('cuda'):
-                refined, guided, ug_dummy, gate  = model(rgb, init_m, sm)
-                _, _, unguided, _ = model(rgb, torch.zeros_like(init_m), sm)
-            guided, unguided, gate = guided.float(), unguided.float(), gate.float()
+        # 强制 float32 以防混用错误
+        refined_f = refined.float()
+        gt_matte_f = gt_matte.float()
+        trimap  = (gt_matte_f > 0.9).float() + (gt_matte_f < 0.1).float()
+        unknown = 1.0 - trimap
 
-            # 融合输出
-            gate_pix = F.interpolate(gate.float(), guided.shape[-2:],
-                                     mode='bilinear', align_corners=False)
-            prediction = (guided + gate_pix * (unguided - guided)).clamp(0, 1)
+        metric_dict = matte_metrics(refined_f, gt_matte_f, trimap, unknown)
+        metrics_logger.update(metric_dict, rgb.size(0))
 
-            # 损失计算 Phase 1
-            loss, l1, lsoft, lw1, lgrad, lssim = compute_phase1_loss(prediction, gt, wave1, accum_steps=1)
-            # Phase 2
-            if epoch > 3:
-                loss += compute_phase2_loss(gt, guided, unguided,
-                                             gate_pix, model, accum_steps=1)
-            # Phase 3
-            if epoch > 6:
-                sub3 = 1 if epoch < 11 else 2
-                loss += compute_phase3_loss(gt, guided, unguided,
-                                             gate, sm, model,
-                                             accum_steps=1, sub3=sub3)
+        # 日志写入
+        with open(loss_log_path, 'a') as f:
+            f.write(json.dumps({'epoch': epoch, 'step': step, **loss_logger.latest()}) + '\n')
+        with open(metrics_log_path, 'a') as f:
+            f.write(json.dumps({'epoch': epoch, 'step': step, **metrics_logger.latest()}) + '\n')
 
-            total_loss += loss.item()
-            count += 1
-
-            # calculate metrics
-            unknown_mask = (trimap >= 0.5).float()
-            batch_metrics = matte_metrics(prediction, gt, trimap=trimap, unknown_mask=unknown_mask)
-            val_logger.update(batch_metrics, n=rgb.size(0))
-
-            # 保存可视化
-            if i % print_int == 0 or i==len(val_loader)-1:
-                avg_metrics = val_logger.summary()
-                metrics_str = "  ".join(f"{k}:{v:.4f}" for k,v in avg_metrics.items())
-                print(f"Train Epoch {epoch} [{i}/{len(val_loader)}] Loss: {loss.item():.4f} | Metrics: {metrics_str} ")
-
-                save_path = os.path.join(vis_dir,
-                                         f"val_e{epoch:02d}_b{i:04d}.png")
-                save_visualization(
-                    rgb, init_m, gt,
-                    prediction, guided, unguided,
-                    gate, sm, save_path
-                )
-
-                # save out the metrics log
-                with open(metrics_log_path, "a") as f:
-                    f.write(json.dumps(avg_metrics) + "\n")
-
-                # save out the loss log
-                entry = {
-                    "total": loss.item(),
-                    "l1":    l1.item(),
-                    "lsoft": lsoft.item(),
-                    "lw1":   lw1.item(),
-                    "lgrad": lgrad.item(),
-                    "lssim": lssim.item()
-                }
-                with open(loss_log_path, "a") as f:
-                    f.write(json.dumps(entry) + "\n")
+        # 定期打印
+        if (step + 1) % print_interval == 0:
+            summary = loss_logger.summary()
+            print(f"[Epoch {epoch:02d} Step {step:04d}] ",
+                  " ".join([f"{k}:{v:.4f}" for k, v in summary.items()]))
 
 
 
-
-if __name__=='__main__':
+if __name__ == "__main__":
     cfg = {
-        'num_epochs':20,'batch_size':2,'print_interval':50,
-        'checkpoint_dir':'checkpoints','csv_path':'../data/pair_for_refiner.csv',
+        'num_epochs': 3,
+        'batch_size': 2,
+        'print_interval': 20,
+        'checkpoint_dir': 'checkpoints',
+        'csv_path': '../data/pair_for_refiner.csv',
         'log_dir': 'log',
-        'resize_to':(736,1280),'num_workers':6,'lr':5e-4,'weight_decay':0,
-        'accum_steps':4,'seed':42
+        'resize_to': (736, 1280),
+        'num_workers': 6,
+        'lr': 1e-4,
+        'weight_decay': 0,
+        'accum_steps': 4,
+        'seed': 42
     }
     os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
     os.makedirs(cfg['log_dir'], exist_ok=True)
 
-    # json log file path
-    train_loss_json_path = f"{cfg['log_dir']}/train_loss.jsonl"
+    train_loss_json_path    = f"{cfg['log_dir']}/train_loss.jsonl"
     train_metrics_json_path = f"{cfg['log_dir']}/train_metrics.jsonl"
-    val_loss_json_path = f"{cfg['log_dir']}/val_loss.jsonl"
-    val_metrics_json_path = f"{cfg['log_dir']}/val_metrics.jsonl"
 
     torch.manual_seed(cfg['seed'])
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if device.type=='cuda': torch.cuda.manual_seed_all(cfg['seed'])
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(cfg['seed'])
 
-    model = RefinerMixedHybrid(base_channels=64, dropout_prob=0.3, wavelet_list=['db1']).to(device)
+    model = RefinerMixedHybrid(
+        base_channels=128,
+        dropout_prob=0.3,
+        wavelet_list=['db1'],
+        err_dropout_prob=0.0
+    ).to(device)
     scaler = GradScaler()
-    opt = optim.Adam(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[7,11], gamma=0.8)
 
-    wave1.to(device); wave2.to(device)
+    wave1.to(device)
+    wave2.to(device)
 
-    for epoch in range(1, cfg['num_epochs']+1):
+    for epoch in range(0, cfg['num_epochs']):
         train_loader, val_loader = build_dataloaders(
-            cfg['csv_path'], cfg['resize_to'],
-            cfg['batch_size'], cfg['num_workers'],
-            seed=cfg['seed'], epoch_seed=cfg['seed']+epoch,
-            shuffle=True, sample_fraction=100
+            cfg['csv_path'],
+            cfg['resize_to'],
+            cfg['batch_size'],
+            cfg['num_workers'],
+            seed=cfg['seed'],
+            epoch_seed=cfg['seed'] + epoch,
+            shuffle=True,
+            sample_fraction=50
         )
-        train_one_epoch(model, train_loader, opt, scaler,
-            device, epoch,
-            cfg['print_interval'],
-            cfg['accum_steps'],
-            'vis_train',
-            train_loss_json_path,
-            train_metrics_json_path,
+
+        apply_stage_control(model, epoch)
+        opt = build_optimizer(model, cfg['lr'], cfg['weight_decay'])
+        scheduler = optim.lr_scheduler.MultiStepLR(opt, milestones=[7, 11], gamma=0.8)
+
+        if epoch == 1:
+            print("===== Gate requires_grad 状态 =====")
+            for n, p in model.gate_head.named_parameters():
+                print(f"{n:<30} {p.requires_grad}")
+
+        train_one_epoch(
+            model, train_loader, opt, scaler, device, epoch,
+            cfg['print_interval'], cfg['accum_steps'],
+            vis_dir='vis_train',
+            loss_log_path=train_loss_json_path,
+            metrics_log_path=train_metrics_json_path
         )
+
         scheduler.step()
-        ckpt = os.path.join(cfg['checkpoint_dir'], f"refiner_ep{epoch:02d}.pth")
-        torch.save(model.state_dict(), ckpt)
-        print(f"✓ Saved checkpoint: {ckpt}")
-
-        val_one_epoch(model, val_loader, device, 'vis_val', 
-            epoch, cfg['print_interval'], 
-            val_loss_json_path,
-            val_metrics_json_path,
-        )
-
+        ckpt_path = os.path.join(cfg['checkpoint_dir'], f"refiner_ep{epoch:02d}.pth")
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"✓ Saved checkpoint: {ckpt_path}")
 
         gate_history.clear()
-        gc.collect(); torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
