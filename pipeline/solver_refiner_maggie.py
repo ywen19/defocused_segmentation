@@ -3,15 +3,16 @@ import sys
 import glob
 import re
 import json
+import gc
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
-from torch.optim.lr_scheduler import OneCycleLR
 
 import matplotlib.pyplot as plt
+import math
 import numpy as np
 import kornia
 from kornia.losses import SSIMLoss
@@ -22,7 +23,6 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from dataload.build_dataloaders import build_dataloaders
 from model.refiner_dwt_maggie import XNetDeep
-from pipeline.utils import *
 
 # --------------------
 # 配置项
@@ -33,37 +33,29 @@ cfg = {
     'freeze_epochs': 3,
     'batch_size': 2,
     'accum_steps': 2,
-    'print_interval': 20,
+    'print_interval': 50,
     'checkpoint_dir': 'checkpoints_xnet',
     'log_dir': 'log_xnet',
     'csv_path': '../data/pair_for_refiner.csv',
-    'vis_dir': 'vis_train',
+    'vis_dir': 'vis_gate',
     'low_res': (368, 640),
     'high_res': (736, 1280),
     'num_workers': 4,
     'lr': 3e-5,
     'weight_decay': 1e-5,
-    'seed': 42
+    'seed': 42,
+    'lambda_gate': 0.02,  # gate 平滑正则系数（略增以更强抑制）
+    'lambda_fill': 0.5,  # 残差补齐权重（更强调填充）
+    'lambda_art': 0.3,  # 残差伪影去除权重（次于补齐）
+    'lambda_edge': 0.2,  # Sobel 边缘重建权重（加强高频细节）
+    'lambda_feather': 0.1,  # Laplacian 羽化平滑权重（平衡边缘自然度）         # Laplacian 羽化平滑权重
 }
 
-# 日志文件路径
 train_loss_json_path = os.path.join(cfg['log_dir'], 'train_loss.jsonl')
 
-# --------------------
-# 环境初始化
-# --------------------
-torch.manual_seed(cfg['seed'])
-np.random.seed(cfg['seed'])
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}, GPUs: {torch.cuda.device_count()}")
-if device.type == 'cuda':
-    torch.cuda.manual_seed_all(cfg['seed'])
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 
 # --------------------
-# 权重初始化函数
+# 初始化与辅助函数
 # --------------------
 def init_weights(m):
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
@@ -77,6 +69,12 @@ def init_weights(m):
         nn.init.xavier_normal_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
+
+
+def set_gate_grad(model, requires_grad: bool):
+    m = model.module if hasattr(model, 'module') else model
+    for p in m.res_gate_conv.parameters(): p.requires_grad = requires_grad
+    m.alpha.requires_grad = requires_grad
 
 
 # --------------------
@@ -98,24 +96,62 @@ def soft_iou_loss(pred, target, eps=1e-6):
 
 
 def tv_loss(x):
-    return (x[..., 1:, :] - x[..., :-1, :]).abs().mean() + (x[..., 1:] - x[..., :, :-1]).abs().mean()
+    # Total variation loss: encourages smoothness
+    # Vertical and horizontal differences
+    vert_diff = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+    hori_diff = (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
+    return vert_diff + hori_diff
 
 
-def compute_total_loss(pred, gt):
+def compute_total_loss(pred, gt, weights=None):
+    """
+    计算多分量损失，总和使用可配置权重。
+    不使用 BCE，以避免二值拉扯，适用于 alpha matte 连续值。
+    weights: dict 包含各损失项权重，若为 None，则从 cfg 中读取动态权重
+    返回 tot_loss 以及各项明细。
+    """
+    if weights is None:
+        # 从 cfg 中读取动态 si/di 权重
+        si_w = cfg.get('w_si_current', cfg.get('lambda_si', 2.0))
+        di_w = cfg.get('w_di_current', cfg.get('lambda_di', 1.0))
+        w = {
+            'si': si_w,
+            'di': di_w,
+            'l1': 1.0,
+            'ss': 1.0,
+            'gr': 0.5,
+            'tv': 0.5,
+            'el': 0.2,
+        }
+    else:
+        w = weights
+    # Soft IoU 损失
     si = soft_iou_loss(pred, gt)
+    # Dice 损失
     inter = (pred * gt).sum((1, 2, 3))
     sums = (pred + gt).sum((1, 2, 3)) + 1e-6
     di = 1.0 - (2 * inter / sums).mean()
-    bc = bce_loss(pred, gt)
+    # L1 损失
     l1 = F.l1_loss(pred, gt)
+    # SSIM 损失
     ss = 1.0 - ssim_loss(pred, gt)
+    # Gradient 损失
     gr = gradient_loss(pred, gt)
+    # TV 损失
     tvv = tv_loss(pred)
+    # Edge 损失
     ep = kornia.filters.sobel(pred)
     eg = kornia.filters.sobel(gt)
     el = F.l1_loss(ep, eg)
-    tot = 2.0 * si + di + bc + l1 + 0.5 * gr + 0.5 * tvv + 0.2 * el
-    return tot, si, di, bc, l1, ss, gr, tvv, el
+    # 加权总和
+    tot = (w['si'] * si +
+           w['di'] * di +
+           w['l1'] * l1 +
+           w['ss'] * ss +
+           w['gr'] * gr +
+           w['tv'] * tvv +
+           w['el'] * el)
+    return tot, si, di, l1, ss, gr, tvv, el
 
 
 # --------------------
@@ -126,137 +162,201 @@ def save_visualization(rgb, init_mask, gt, outputs, loss_curve, save_path):
 
     def to_np(x):
         x_t = x.detach().cpu()
-        # 统一到 4D: (B, C, H, W)
         if x_t.ndim == 4:
             pass
         elif x_t.ndim == 3:
             x_t = x_t.unsqueeze(0)
         elif x_t.ndim == 2:
             x_t = x_t.unsqueeze(0).unsqueeze(0)
-        # 平均通道
         x_t = x_t.mean(dim=1, keepdim=True)
-        # 上采样到原始尺寸
         x_t = F.interpolate(x_t, size=orig, mode='bilinear', align_corners=False)
         return x_t[0, 0].numpy()
 
-    main, lf1, hf1, lf2, hf2, fused, lx1, hx1, lx2, hx2, aux1, aux2 = outputs
-    fig, axs = plt.subplots(4, 4, figsize=(16, 16))
-    im_list = [rgb[0].permute(1, 2, 0).cpu().numpy(), init_mask, gt, main,
-               lf1, hf1, lf2, hf2, fused, lx1, hx1, lx2, hx2, aux1, aux2]
-    cmaps = [None, 'gray', 'gray', 'gray', 'viridis', 'magma', 'plasma', 'cividis',
-             'inferno', 'cubehelix', 'cividis', 'inferno', 'plasma', 'gray', 'gray']
-    for ax, im, cmap in zip(axs.flatten(), im_list, cmaps):
-        if isinstance(im, torch.Tensor):
-            ax.imshow(to_np(im), cmap=cmap)
-        else:
-            ax.imshow(im, cmap=cmap)
-        ax.axis('off')
-    axs[-1, -1].plot(loss_curve[-500:]);
-    axs[-1, -1].set_title('Loss')
-    plt.tight_layout();
-    plt.savefig(save_path);
+    main, lf1, hf1, lf2, hf2, fused, lx1, hx1, lx2, hx2, aux1, aux2, trunk, g = outputs
+    im_list = [
+        rgb[0].permute(1, 2, 0).cpu().numpy(),  # RGB
+        init_mask[0, 0].cpu().numpy(),  # Init mask (gray)
+        gt[0, 0].cpu().numpy(),  # GT mask (gray)
+        to_np(main), to_np(lf1), to_np(hf1), to_np(lf2), to_np(hf2),
+        to_np(fused), to_np(lx1), to_np(hx1), to_np(lx2), to_np(hx2),
+        to_np(aux1), to_np(aux2), to_np(trunk), to_np(g)
+    ]
+    titles = ['RGB', 'Init', 'GT', 'Main', 'LF1', 'HF1', 'LF2', 'HF2', 'Fused', 'LX1', 'HX1', 'LX2', 'HX2', 'Aux1',
+              'Aux2', 'Trunk', 'Gate']
+    # 指定 Init 和 GT 为灰度，其余 feature 也用灰度
+    cmaps = [None, 'gray', 'gray'] + ['gray'] * (len(im_list) - 3)
+
+    cols = 5
+    rows = math.ceil((len(im_list) + 1) / cols)
+    fig, axs = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    axs = axs.flatten()
+
+    for i, (im, title) in enumerate(zip(im_list, titles)):
+        axs[i].imshow(im, cmap=cmaps[i])
+        axs[i].set_title(title)
+        axs[i].axis('off')
+
+    # loss 曲线
+    axs[len(im_list)].plot(loss_curve[-500:])
+    axs[len(im_list)].set_title('Loss')
+    axs[len(im_list)].axis('off')
+
+    # 隐藏多余子图
+    for j in range(len(im_list) + 1, rows * cols):
+        axs[j].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(save_path)
     plt.close(fig)
 
 
 # --------------------
-# 单个 Epoch 训练函数
+# 训练每周期
 # --------------------
 def train_one_epoch(epoch, loader, optimizer, scaler, mode='low'):
-    model.train()
+    model.train();
     optimizer.zero_grad()
     for step, batch in enumerate(loader):
         rgb, init_mask, gt = [x.to(device) for x in batch[:3]]
         with autocast(device_type=device.type):
-            outputs = model(rgb)
-            tot, *_ = compute_total_loss(outputs[0], gt)
-            loss = tot / cfg['accum_steps']
-        # 记录到 jsonl 日志
-        with open(train_loss_json_path, 'a') as f:
-            f.write(json.dumps({'epoch': epoch, 'step': step, 'loss': loss.item() * cfg['accum_steps']}) + '\n')
-        loss_history.append(loss.item() * cfg['accum_steps'])
-        if step % cfg['print_interval'] == 0:
-            print(f"[E{epoch} - {mode}] Step {step}: Loss={loss.item() * cfg['accum_steps']:.4f}")
+            outputs = model(rgb, init_mask)
+            main_up, *_, aux1, aux2, trunk_up, g = outputs
+            # 主/辅助
+            tot, *_ = compute_total_loss(main_up, gt)
+            tot1, *_ = compute_total_loss(aux1, gt)
+            tot2, *_ = compute_total_loss(aux2, gt)
+            loss_seg = tot;
+            aux_loss = 0.4 * (tot1 + tot2)
+            # gate正则
+            reg_gate = cfg['lambda_gate'] * (g.mean() if model.module.use_gate else 0.0)
+            # 高频/羽化/残差
+            if model.module.use_gate and epoch >= cfg['warmup_epochs'] + cfg['freeze_epochs']:
+                loss_edge = F.l1_loss(kornia.filters.sobel(main_up), kornia.filters.sobel(gt))
+                loss_feather = F.l1_loss(kornia.filters.laplacian(main_up, 3), kornia.filters.laplacian(gt, 3))
+                reg_edge = cfg['lambda_edge'] * loss_edge
+                reg_feather = cfg['lambda_feather'] * loss_feather
+                ramp = cfg['num_epochs'] - (cfg['warmup_epochs'] + cfg['freeze_epochs']);
+                half = ramp // 2
+                w_fill, w_art = (3.0, 1.0) if epoch < cfg['warmup_epochs'] + cfg['freeze_epochs'] + half else (1.0, 1.0)
+                res = init_mask - trunk_up
+                loss_fill = (g * F.relu(res)).abs().mean() * w_fill * cfg['lambda_fill']
+                loss_art = (g * F.relu(-res)).abs().mean() * w_art * cfg['lambda_art']
+            else:
+                reg_edge = reg_feather = loss_fill = loss_art = 0.0
+            loss = (loss_seg + aux_loss + reg_gate + reg_edge + reg_feather + loss_fill + loss_art) / cfg['accum_steps']
         scaler.scale(loss).backward()
         if (step + 1) % cfg['accum_steps'] == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.unscale_(optimizer);
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer);
+            scaler.update();
             optimizer.zero_grad()
+        if step % cfg['print_interval'] == 0:
+            print(f"[E{epoch}-{mode}] Step{step}:Loss={loss.item() * cfg['accum_steps']:.4f}")
         if (step + 1) % (cfg['print_interval'] * 2) == 0:
-            save_path = os.path.join(cfg['vis_dir'], f"e{epoch:02d}_{mode}_s{step:04d}.png")
-            save_visualization(rgb, init_mask, gt, outputs, loss_history, save_path)
+            save_visualization(rgb, init_mask, gt, outputs, loss_history,
+                               os.path.join(cfg['vis_dir'], f"e{epoch}_{mode}_{step}.png"))
 
 
 # --------------------
-# 主训练流程
+# 主流程
 # --------------------
 if __name__ == '__main__':
+    torch.manual_seed(cfg['seed'])
+    np.random.seed(cfg['seed'])
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(cfg['seed'])
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     os.makedirs(cfg['vis_dir'], exist_ok=True)
     os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
     os.makedirs(cfg['log_dir'], exist_ok=True)
-    # 清空训练日志文件
-    with open(train_loss_json_path, 'w') as f:
-        pass
+    open(train_loss_json_path, 'w').close()
 
-    # 构建加载器
     low_loader, _ = build_dataloaders(
-        cfg['csv_path'], cfg['low_res'], cfg['batch_size'], cfg['num_workers'],
-        True, cfg['seed'], sample_fraction=1
+        cfg['csv_path'], cfg['low_res'], cfg['batch_size'],
+        cfg['num_workers'], True, cfg['seed'], sample_fraction=80
     )
     high_loader, _ = build_dataloaders(
-        cfg['csv_path'], cfg['high_res'], cfg['batch_size'], cfg['num_workers'],
-        True, cfg['seed'], sample_fraction=1
+        cfg['csv_path'], cfg['high_res'], cfg['batch_size'],
+        cfg['num_workers'], True, cfg['seed'], sample_fraction=80
     )
 
-    # 模型与优化器
     model = XNetDeep().to(device)
     model.apply(init_weights)
+
     optimizer = optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scaler = GradScaler()
 
-    # 恢复 checkpoint
+    model = nn.DataParallel(model)
+
+    ramp_start = cfg['warmup_epochs'] + cfg['freeze_epochs']
     cks = glob.glob(os.path.join(cfg['checkpoint_dir'], 'epoch*.pth'))
     if cks:
         cks.sort(key=lambda x: int(re.search(r'epoch(\d+)', x).group(1)))
-        ck = cks[-1]
-        start_epoch = int(re.search(r'epoch(\d+)', ck).group(1)) + 1
-        model.load_state_dict(torch.load(ck, map_location=device))
-        print(f"Resume from {ck}, starting at epoch {start_epoch}")
+        start_epoch = int(re.search(r'epoch(\d+)', cks[-1]).group(1)) + 1
+        model.load_state_dict(torch.load(cks[-1], map_location=device));
+        print(f"Resume from {cks[-1]}, epoch{start_epoch}")
     else:
-        start_epoch = 0
-        print('Start training from scratch')
-
-    model = nn.DataParallel(model)
-
+        start_epoch = 0; print('Start training from scratch')
     loss_history = []
-    # Main loop
+
     for epoch in range(start_epoch, cfg['num_epochs']):
-        # Phase1: low-res warm-up
+        # Gate 开关与参数冻结/解冻
+        if epoch < ramp_start:
+            model.module.use_gate = False
+            set_gate_grad(model, False)
+        else:
+            model.module.use_gate = True
+            set_gate_grad(model, True)
+            # alpha 调度：最后 3 个 epoch 直接拉满
+            if epoch >= cfg['num_epochs'] - 3:
+                alpha = 1.0
+            else:
+                total_steps = cfg['num_epochs'] - 1 - ramp_start
+                rel_step = max(0, epoch - ramp_start)
+                alpha = 0.1 + (1.0 - 0.1) * (rel_step / total_steps)
+                alpha = min(alpha, 1.0)
+            with torch.no_grad():
+                model.module.alpha.data.fill_(alpha)
+
+        print(f"Epoch {epoch}: gate {'ON' if model.module.use_gate else 'OFF'}, alpha={model.module.alpha.item():.3f}")
+
+        # 训练阶段选择
         if epoch < cfg['warmup_epochs']:
-            print(f"Epoch {epoch}: Low-res warm-up")
+            # Warmup 阶段
             train_one_epoch(epoch, low_loader, optimizer, scaler, mode='low')
         else:
-            # Phase2: high-res with freeze/unfreeze
+            # 高分辨率阶段：包含 Freeze & Unfreeze
             if epoch == cfg['warmup_epochs']:
-                for m in [model.dwt, model.lf_enc1, model.hf_enc1,
-                          model.lf_enc2, model.hf_enc2,
-                          model.aspp_lf, model.aspp_hf]:
-                    for p in m.parameters(): p.requires_grad = False
-                # 调整学习率至高分辨率阶段初始值
+                # Freeze backbone
+                for m in [model.module.dwt, model.module.lf1_enc, model.module.hf1_enc,
+                          model.module.lf2_enc, model.module.hf2_enc,
+                          model.module.aspp_lf, model.module.aspp_hf]:
+                    for p in m.parameters():
+                        p.requires_grad = False
+                # 提升学习率
                 new_lr = cfg['lr'] * 1.2
                 for g in optimizer.param_groups:
                     g['lr'] = new_lr
-                print(f"Freeze backbone for initial high-res training, set lr={new_lr}")
-            if epoch == cfg['warmup_epochs'] + cfg['freeze_epochs']:
-                for p in model.parameters(): p.requires_grad = True
-                print("Unfreeze entire network for fine-tuning")
-            # 高分辨率训练
-            print(f"Epoch {epoch}: High-res training")
+                print(f"Freeze backbone, lr={new_lr}")
+            if epoch == ramp_start:
+                # Unfreeze all
+                for p in model.parameters():
+                    p.requires_grad = True
+                print("Unfreeze all modules")
+            # High-res 训练
             train_one_epoch(epoch, high_loader, optimizer, scaler, mode='high')
 
         # 保存 checkpoint
-        ckpt_path = os.path.join(cfg['checkpoint_dir'], f'epoch{epoch}.pth')
-        torch.save(model.state_dict(), ckpt_path)
-        print(f"Checkpoint saved: {ckpt_path}")
-    print('✅ 训练完成！')
+        ckpt = os.path.join(cfg['checkpoint_dir'], f'epoch{epoch}.pth')
+        torch.save(model.state_dict(), ckpt)
+        print(f"Saved checkpoint: {ckpt}")
+        # 清理显存
+        gc.collect()
+        torch.cuda.empty_cache()
+
+print('✅ Training complete!')
