@@ -9,13 +9,9 @@ The dataset we used is derived from [Background Matting 240K](https://grail.cs.w
 ## 1. Environment Configuration
 Due to package conflicting, we adopted two environment configurations for our project.
 
-<b>Under project root directory</b>
 To create our defocused dataset:
-```
-chmod +x defocus_env_setup.sh
-./defocus_env_setup.sh
-conda activate defocused-env
-```
+Clone Video-Depth-Anything repo from its official github page;
+Follow the instruction to install the environment, then activate the environment.
 
 To run our model:
 ```
@@ -118,4 +114,10 @@ conda activate sam2_matanyone
 cd pipeline
 python solver_refiner_maggie.py
 
+```
+
+To run validation,
+`cd` to the project root directory;
+```
+python inference.py --i <image_path> --c <checkpoint_path> --o <image_output_path> --resize_h(opt) 720 --resize_w(opt) 1080
 ```
