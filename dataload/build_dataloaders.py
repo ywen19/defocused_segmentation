@@ -10,7 +10,9 @@ def build_dataloaders(
     seed=42,
     epoch_seed=None,
     shuffle=True,
-    sample_fraction=1.0
+    sample_fraction=1.0,
+    do_crop: bool = False,
+    crop_size=(512, 512)
 ):
     """
     Build training and validation DataLoaders using TorchData IterableDataPipes.
@@ -32,14 +34,22 @@ def build_dataloaders(
 
     # Step 1: Split data
     train_rows, val_rows = split_csv(csv_path, split_ratio=split_ratio, seed=seed)
+    print(f"val rows: {len(val_rows)}")
 
     # Step 2: Apply sampling
     train_rows = train_rows[:max(1, int(len(train_rows) * sample_fraction))]
     val_rows = val_rows[:max(1, int(len(val_rows) * sample_fraction))]
+    print(f"val rows: {len(val_rows)}")
 
     # Step 3: Build Iterable DataPipes with epoch seed
-    train_pipe = build_iterable_datapipe(train_rows, resize_to=resize_to, shuffle=shuffle, seed=epoch_seed or seed)
-    val_pipe = build_iterable_datapipe(val_rows, resize_to=resize_to, shuffle=False, seed=seed)
+    train_pipe = build_iterable_datapipe(
+        train_rows, resize_to=resize_to, shuffle=shuffle, seed=epoch_seed or seed,
+        do_crop = do_crop, crop_size=crop_size,
+        )
+    val_pipe = build_iterable_datapipe(
+        val_rows, resize_to=resize_to, shuffle=False, seed=seed,
+        do_crop = False, crop_size=crop_size,
+        )
 
     # Step 4: Wrap in DataLoader
     train_loader = DataLoader(train_pipe, batch_size=batch_size, num_workers=num_workers, pin_memory=True)

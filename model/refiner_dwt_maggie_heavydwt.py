@@ -4,30 +4,111 @@ import torch.nn.functional as F
 import numpy as np
 import math
 import kornia
+import pywt
+
+SUPPORTED_WAVELETS = ["db1", "db2", "db4"]
 
 # ---------------------------
 # 可微 DWT 模块
 # ---------------------------
-class DWT(nn.Module):
-    def __init__(self, wave='haar'):
+wavelet_filters = {}
+wavelet_inv_filters = {}
+
+for name in SUPPORTED_WAVELETS:
+    # 从 PyWavelets 里拿到 1D 低通/高通系数
+    w = pywt.Wavelet(name)
+    # 注意：PyWavelets 返回的 dec_lo/dec_hi 是“常规方向”，
+    # 但在 conv2d 里做“分解”时要把它们反转 ([::-1])。
+    dec_lo = torch.tensor(w.dec_lo[::-1], dtype=torch.float32)  # 1D 低通 (已反转)
+    dec_hi = torch.tensor(w.dec_hi[::-1], dtype=torch.float32)  # 1D 高通 (已反转)
+
+    # 同理，如果以后要重构（inverse DWT），可以拿 rec_lo/rec_hi
+    rec_lo = torch.tensor(w.rec_lo, dtype=torch.float32)
+    rec_hi = torch.tensor(w.rec_hi, dtype=torch.float32)
+
+    # 拼成 2D 子带卷积核：顺序依次是 [LL, LH, HL, HH]，每个都是形状 (2,2)
+    # 1) LL: dec_lo ⊗ dec_lo / 2
+    # 2) LH: dec_lo ⊗ dec_hi
+    # 3) HL: dec_hi ⊗ dec_lo
+    # 4) HH: dec_hi ⊗ dec_hi
+    filt_ll = (dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1)) / 2.0
+    filt_lh =  dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1)
+    filt_hl =  dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1)
+    filt_hh =  dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)
+
+    # 把这 4 个子带 kernel 堆叠起来，然后加一个维度变成 (4,1,2,2)
+    filt = torch.stack([filt_ll, filt_lh, filt_hl, filt_hh], dim=0)[:, None, :, :]
+
+    # 重构部分（inverse DWT）暂时留着，如果后面有人想做 IDWT，可以参考
+    inv_ll = rec_lo.unsqueeze(0) * rec_lo.unsqueeze(1) * 2.0
+    inv_lh = rec_lo.unsqueeze(0) * rec_hi.unsqueeze(1)
+    inv_hl = rec_hi.unsqueeze(0) * rec_lo.unsqueeze(1)
+    inv_hh = rec_hi.unsqueeze(0) * rec_hi.unsqueeze(1)
+    inv = torch.stack([inv_ll, inv_lh, inv_hl, inv_hh], dim=0)[:, None, :, :]
+
+    wavelet_filters[name]     = filt      # 分解用
+    wavelet_inv_filters[name] = inv       # 重构用（如果需要）
+
+
+class DWTModule(nn.Module):
+    """
+    通用的可微 DWT 模块，支持 db1/db2/db4 等小波，只需在初始化时传 wavelet name。
+    - x: (B, C, H, W)  
+    - 返回:
+        LL: (B, C, H//2, W//2)
+        HF: (B, 3*C, H//2, W//2)  # 通道顺序是 LH/HL/HH × C
+    """
+    def __init__(self, wname="db1"):
         super().__init__()
-        lp = torch.tensor([1.0, 1.0]) / np.sqrt(2.0)
-        hp = torch.tensor([1.0, -1.0]) / np.sqrt(2.0)
-        ll = lp.unsqueeze(1) @ lp.unsqueeze(0)
-        lh = lp.unsqueeze(1) @ hp.unsqueeze(0)
-        hl = hp.unsqueeze(1) @ lp.unsqueeze(0)
-        hh = hp.unsqueeze(1) @ hp.unsqueeze(0)
-        for name, kern in [('ll', ll), ('lh', lh), ('hl', hl), ('hh', hh)]:
-            self.register_buffer(name, kern.unsqueeze(0).unsqueeze(0))
+        assert wname in SUPPORTED_WAVELETS, f"Unsupported wavelet {wname}"
+        # 取出对应的(4,1,2,2) 分解卷积核
+        filt = wavelet_filters[wname]  # torch.Tensor of shape (4,1,2,2)
+        # 保存到 buffer 里，这样模型 to(device) 时也会自动移动
+        self.register_buffer('filt', filt)  # (4,1,2,2)
 
     def forward(self, x):
-        B,C,H,W = x.shape
-        f = {k: v.repeat(C,1,1,1) for k,v in [('ll',self.ll),('lh',self.lh),('hl',self.hl),('hh',self.hh)]}
-        LL = F.conv2d(x, f['ll'], stride=2, groups=C)
-        LH = F.conv2d(x, f['lh'], stride=2, groups=C)
-        HL = F.conv2d(x, f['hl'], stride=2, groups=C)
-        HH = F.conv2d(x, f['hh'], stride=2, groups=C)
-        HF = torch.cat([LH,HL,HH], dim=1)
+        """
+        x: (B, C, H, W)
+        return: (LL, HF)
+        - LL: (B, C, H//2, W//2)
+        - HF: (B, 3*C, H//2, W//2), 顺序 [LH_i, HL_i, HH_i] for i=0..C-1
+        """
+        B, C, H, W = x.shape
+
+        # 每个分解核都是 2×2，pad = (2-1)//2 = 0 if 我们不想丢帧？  
+        # 但为了保证输出 H//2、W//2 时边界对齐，一般做 pad=1（reflect），
+        # 这样每次卷积后还能保持对边界的采样覆盖，避免边缘信息丢失。
+        pad = 1
+        x_pad = F.pad(x, (pad, pad, pad, pad), mode='reflect')
+        # x_pad: (B, C, H+2, W+2)
+
+        # 将 (4,1,2,2) → (4*C,1,2,2)，方便接下来分组卷积。
+        # 先把 filt repeat C 次: (4,1,2,2) → (4, C,2,2)
+        filt_expand = self.filt.repeat(1, C, 1, 1)  # (4, C, 2, 2)
+        # 然后 reshape 成 (4*C, 1, 2, 2)
+        filt_expand = filt_expand.view(4 * C, 1, 2, 2)
+
+        # Depthwise conv：groups = C 表示每 C 个输出 channel 对应输入的同一个 channel
+        # 这里我们想每个通道“独立”做 4 次卷积 (LL/LH/HL/HH)，
+        # 最终 output 会是 shape=(B, 4*C, H//2, W//2)：
+        #   - 前 C 个通道是 LL_0…LL_{C-1}
+        #   - 接下来 C 个通道是 LH_0…LH_{C-1}
+        #   - 再下来 C 个通道是 HL_0…HL_{C-1}
+        #   - 最后 C 个通道是 HH_0…HH_{C-1}
+        # 注意：stride=2 下采样
+        out = F.conv2d(x_pad, filt_expand, stride=2, groups=C)
+
+        # out: (B, 4*C, H//2, W//2)
+        # 第一组 LL 再 split 掉
+        LL = out[:, 0:C, :, :]  # (B, C, H//2, W//2)
+
+        # 剩余的三组 HF 放在一起：我们要把它们拼成 (B, 3*C, H//2, W//2)
+        # LH 通道在 out[:, C:2C, ...]
+        LH = out[:,   C:2*C,  :,  :]
+        HL = out[:, 2*C:3*C,  :,  :]
+        HH = out[:, 3*C:4*C,  :,  :]
+        HF = torch.cat([LH, HL, HH], dim=1)  # (B, 3*C, H//2, W//2)
+
         return LL, HF
 
 # ---------------------------
@@ -296,9 +377,9 @@ class SwinWindowCrossBand(nn.Module):
 # ---------------------------
 class XNetDeep(nn.Module):
     def __init__(self, in_channels=3, base_channels=64, num_classes=1,
-                 wave='haar', window_size=8, reduction=16, num_heads=4, chunk_size=64):
+                 wave='db1', window_size=8, reduction=16, num_heads=4, chunk_size=64):
         super().__init__()
-        self.dwt = DWT(wave)
+        self.dwt = DWTModule(wname=wave)
         # encoder level1
         self.lf1 = EncoderBlock(in_channels, base_channels)
         self.hf1 = EncoderBlock(in_channels*3, base_channels)
@@ -332,7 +413,7 @@ class XNetDeep(nn.Module):
         self.res_gate=nn.Conv2d(2,1,3,padding=1)
 
         self.alpha=nn.Parameter(torch.zeros(1))
-        nn.init.constant_(self.res_gate.bias,-5.0)
+        nn.init.constant_(self.res_gate.bias, -2.0)
         nn.init.kaiming_normal_(self.res_gate.weight,mode='fan_in',nonlinearity='sigmoid')
         self.use_gate=True
         self.use_trunk_aux = True
@@ -440,7 +521,7 @@ if __name__ == "__main__":
         in_channels=C,
         base_channels=128,
         num_classes=1,
-        wave='haar',
+        wave='db1',
         window_size=16,   # now flexible
         reduction=16,
         num_heads=8,
@@ -455,3 +536,5 @@ if __name__ == "__main__":
     with torch.no_grad():
         outs_on = model(x, init_mask)
     print("Gate ON :", [o.shape for o in outs_on])
+
+
